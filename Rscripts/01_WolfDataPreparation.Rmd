@@ -1,0 +1,1007 @@
+---
+title: "DataPreparation"
+author: "Aimara Planillo"
+date: "1/28/2021"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Prepare data for Wolf Habitat Suitability - GERMANY 
+
+### Load packages and workspace from source file
+```{r}
+source(paste0(getwd(), "/R/source_file.R"))
+workDir <- getwd()
+dataproc_wd <- file.path(workDir, "output/data-proc")
+
+set.seed(155)
+```
+
+
+####################
+## telemetry data ##
+####################
+
+This is already processed data provided by Moritz. Data was selected to represent only 
+resident adult individuals, which are the ones used in the models.
+
+## Load and check telemetry
+```{r}
+# load all GPS data for resident adults
+gps_points <- readRDS("data-raw/gps_points_3035_crop_adults_20190130.rds")
+table(gps_points$status)
+nrow(gps_points)
+# [1] 46304
+length(unique(gps_points$animalID))
+# [1] 20
+table(gps_points$animalID)
+
+# basic summaries
+gps_summary <- gps_points %>%
+  dplyr::select(-geometry) %>% 
+  group_by(animalID) %>%
+  summarise(n = n()) 
+mean(gps_summary$n)
+# [1] 2315.2 # average number of points per individual
+sd(gps_summary$n)
+# [1] 2153.612 # sd of the number of points per ind
+range(gps_summary$n)
+# [1]  142 8499 # min and max values of the number of points per ind
+
+
+##  Plot the locations colorcode by individual
+tmap_mode("view")
+tm_shape(as_Spatial(gps_points)) +
+  tm_dots("animalID")
+
+# check how the points per individual look like
+## Number of points per territory. Individuals with no named territories show 0 values
+table(gps_points$territory, gps_points$animalID)
+
+# Individual ID1 Has two territories, we divide them based on the name of territory 
+# into two "effective individuals". 
+
+gps_21ter <- gps_points %>%
+  mutate(id = case_when(
+    animalID == "ID1" & territory == "Prösa" ~ "ID1p", 
+    TRUE ~ animalID))
+
+table(gps_21ter$id)
+
+# check on map it territories look correct
+tm_shape(as_Spatial(gps_21ter)) +
+  tm_dots("id")
+
+# check if the temporal line for both territories in ID1 makes sense
+tmap_mode("plot")
+gps_21ter %>%
+  filter(animalID == "ID1") %>%
+  mutate(order = seq(1, nrow(gps_21ter[gps_21ter$animalID == "ID1",]))) %>% 
+  group_by(id) %>% 
+  as_Spatial() %>% 
+  tm_shape() +
+  tm_dots(col = "order", shape = "id", size = 1)
+
+gps_21ter %>%
+   filter(animalID == "ID1") %>%
+   ggplot(aes(timestamp, id)) +
+   geom_point(aes(col = territory)) +
+   scale_x_datetime(labels = scales::date_format("%m.%Y"), 
+                    breaks = seq(ISOdate(2009,1,1), 
+                                 by = "3 months", 
+                                 length.out = 40))  
+    
+# Some points seem to overlap a bit around year 2018, more in detail:
+test <- gps_21ter %>% 
+  filter(animalID == "ID1") %>% 
+  mutate(year = case_when(
+    timestamp >= "2018-01-01" ~ "af2018",
+    TRUE ~ "bf2018")) %>% 
+  group_by(id, year) %>% 
+  summarise(territory_id = "territory",
+            n = n()) 
+test            
+
+## Remove the "overlapping points as transient phase
+gps_21ter2 <- gps_21ter %>%
+  mutate(year = case_when(
+    timestamp >= "2018-01-01" ~ "af2018",
+    TRUE ~ "bf2018")) %>% 
+  filter(!(id == "ID1" & year == "af2018")) %>%
+  filter(!(id == "ID1p" & year == "bf2018"))
+nrow(gps_21ter2)
+# [1] 46175 # 129 gps locations removed
+```
+
+## Create MCPs
+
+We are going to create the 95% MCPs from the gps locations to extract home range information.
+Then, we select data before 2018 for running the model and create a 100% MCP for background points in the models
+
+```{r}
+## 95% MCPs
+
+# Only include three columns (id, x, and y coordinates) for making MCP's
+mcp_dataframe <- gps_21ter2 %>%
+  as.data.frame() %>%
+  dplyr::select(id) 
+mcp_dataframe <- cbind(mcp_dataframe, st_coordinates(gps_21ter2))
+head(mcp_dataframe)
+nrow(mcp_dataframe)
+# [1] 46175 # Same as gps locations
+
+# To compute the mcp in adehabitatHR package we need an sp object
+#Create a SpatialPointsDataFrame by defining the coordinates
+coordinates(mcp_dataframe) <- c("X", "Y")
+# Set the coordinate reference system (CRS)
+proj4string(mcp_dataframe) <- CRS( "+init=epsg:3035" )
+
+# Calculate 95% MCPs for each territory
+mcp95_all <- mcp(mcp_dataframe, percent = 95)
+
+# Examine output
+mcp95_all
+plot(mcp95_all)
+
+nrow(mcp95_all)
+# [1] 21 # Number of territories. Remember that id1 was split
+length(unique(mcp95_all$id))
+
+mcp95_all$color <- as.character(viridis(21)) #add a column to give colours to the polygons based on viridis palette
+tm_shape(mcp95_all) +
+  tm_borders(col = mcp95_all$color) 
+
+# save 95% mcp as geopackage
+mcp95_all_sf <- st_as_sf(mcp95_all, crs = 3035)
+plot(st_geometry(mcp95_all_sf))
+
+## Get starting and ending date of data for each individual
+gps_dates <- gps_21ter2 %>% 
+  group_by(id) %>% 
+  arrange(timestamp) %>% 
+  summarise(start_date = first(timestamp),
+            end_date = last(timestamp)) %>% 
+  as.data.frame() %>% 
+  dplyr::select(-geometry)
+
+## Add dates to mcp 
+mcp95_all_dates <- left_join(gps_dates, mcp95_all_sf, by = "id") %>% 
+  st_as_sf
+# write_sf(mcp95_all_sf, paste0(dataproc_wd, "/gps_MCP95_adults_allpoints_3035.gpkg"))
+
+
+## 100% MCPs before 2018
+
+# We divide dataset before and after 2018
+gps_bf2018 <- gps_21ter2 %>%
+  filter(year == "bf2018")
+length(unique(gps_bf2018$id))
+#  18
+
+gps_af2018 <- gps_21ter2 %>%
+  filter(year == "af2018")  
+length(unique(gps_af2018$id))
+# 5
+
+## Calculate 100 MCPs for each individual before 2018
+mcp_bf2018_dataframe <- gps_bf2018 %>%
+  as.data.frame() %>%
+  dplyr::select(id) %>% 
+  droplevels()
+mcp_bf2018_dataframe <- cbind(mcp_bf2018_dataframe, st_coordinates(gps_bf2018))
+head(mcp_bf2018_dataframe)
+nrow(mcp_bf2018_dataframe)
+# [1] 28122 # locations before 2018
+table(mcp_bf2018_dataframe$id)
+
+coordinates(mcp_bf2018_dataframe) <- c("X", "Y")
+proj4string(mcp_bf2018_dataframe) <- CRS( "+init=epsg:3035" )
+
+mcp100_bf2018 <- mcp(mcp_bf2018_dataframe, percent = 100)
+mcp100_bf2018
+nrow(mcp100_bf2018)
+# [1] 18
+gps_mcp100_bf2018 <- st_as_sf(mcp100_bf2018, crs = 3035)
+plot(st_geometry(gps_mcp100_bf2018))
+# write_sf(gps_mcp100_bf2018, paste0(dataproc_wd, "/gps_MCP100_adults_bf2018_3035.gpkg"))
+```
+
+Get estimates of area from the MCPs
+```{r}
+# area of MCPs:
+mcp95_km2 <- st_area(mcp95_all_sf)/1000000
+
+## Average values of the 95% MCPs
+mcp95_km2 %>% 
+  as.data.frame() %>% 
+  summarise_all(list(mean = mean, sd = sd, 
+                                      median = median, 
+                                      min = min, max = max)) %>% 
+  t()
+#            [,1]
+# mean   234.4418
+# sd     129.0340
+# median 244.6626
+# min     45.8442
+# max    461.7623
+```
+
+
+## Filter telemetry data as 1 observation per day and 1 per grid cell 
+We do this to avoid temp and spatial autocorrelation
+
+A. Select one observation per day per individual
+```{r}
+gps21_summary <- gps_21ter2 %>%
+  group_by(id) %>%
+  summarise(n = n())
+
+length(unique(gps_21ter2$id))
+nrow(gps21_summary)
+mean(gps21_summary$n)
+# [1] 2198.81 # average points per ind
+sd(gps21_summary$n)
+# [1] 2140.341 # sd points per ind
+range(gps21_summary$n)
+# [1]  142 8499 # min max points per ind:
+
+gps21_summary$id[gps21_summary$n == 142]
+# [1] "MT3"
+gps21_summary$id[gps21_summary$n == 8499]
+# [1] "WR4"
+
+# temporal scale of data
+head(gps_21ter2)
+times <- gps_21ter2$timestamp 
+# differences in hours bt observatinons
+times_dif <- difftime(times[-length(times)], times[-1], unit = "hour") 
+times_dif <- c(0, as.numeric(times_dif)) # we add 0 to the first difference
+times_dif <- cbind.data.frame(id = gps_21ter2$id, times_dif)
+str(times_dif)
+summary(times_dif)
+
+# to calculate average time, we remove first entry because it does not make sense
+times_dif <- times_dif[duplicated(times_dif$id),]
+
+# now we remove values that are too high 
+times_dif_filtered <- times_dif %>% 
+  filter(times_dif %in% (-30:30)) # keep values between -30 and 30 hours
+
+times_dif[times_dif$id == "ID1",]
+
+summary_times_dif <- times_dif_filtered %>%
+  group_by(id) %>%
+  summarise(mean = mean(times_dif), 
+            sd = sd(times_dif))
+
+as.data.frame(summary_times_dif)
+
+# Usually 1 hour or 4 hours intervals. We check weird numbers:
+gps_21ter2[gps_21ter2$id == "FT10",] # 1h interval
+gps_21ter2[gps_21ter2$id == "FT9",] # 4h interval
+gps_21ter2[gps_21ter2$id == "MT3",] # 4h interval
+as.data.frame(gps_21ter2[gps_21ter2$id == "WF3", ]) # Irregular: 1,2,3,6 h interval
+gps_21ter2[gps_21ter2$id == "WR1",] # 3h interval
+as.data.frame(gps_21ter2[gps_21ter2$id == "WF5", ]) # 1-3h interval
+
+
+# extract date for each observation, group by date and individual 
+#(using the newly created id column to separate the two territories for individual id1!!)
+#and select a random observation
+gps_points_filter_day <- gps_21ter2 %>%
+  mutate(date = as_date(timestamp)) %>%
+  group_by(id, date) %>%
+  sample_n(1)
+
+nrow(gps_points_filter_day)
+# [1] 4949
+
+# plot to check
+tm_shape(gps_21ter2) + # all gps points in red
+  tm_dots("red") +
+  tm_shape(gps_points_filter_day) + #filtered gps points in blue
+  tm_dots("blue") 
+# there is a clear difference in the number of points, as expected. 
+
+table(gps_points_filter_day$id)
+```
+
+
+B. Select one observation per cell 
+
+```{r}
+# load land cover raster to use the resolution as reference for the grids
+envir_stack <- stack("./data-raw/geo-raw/stack_all_env_vars_20181220.tif")
+names(envir_stack) <- c("g100_clc12_V18_5", "popu01clcv5", "mos2_dist_settlments", "mos2_dist_streets", "HFP2009_int")
+copernicus_lc_3035 <- envir_stack$g100_clc12_V18_5
+
+# extract coordinates of 1 observation per grid cell
+gps_filtered_day_grid <- gridSample(st_coordinates(gps_points_filter_day), 
+                           copernicus_lc_3035, 
+                           n = 1) %>%
+  as.data.frame() 
+
+nrow(gps_filtered_day_grid)
+# [1] 3841
+
+# transform to sf object
+gps_filtered_day_grid <- st_as_sf(gps_filtered_day_grid, 
+                            coords = c("X","Y"), 
+                            crs = 3035, 
+                            sf_column_name = "geometry") # we need this parameter to run the function
+
+# add the individual Id by spatial join
+gps_filtered_day_grid_ind <-  st_join(gps_filtered_day_grid, gps_21ter2, 
+                                      join = st_nearest_feature,
+                                      left = TRUE)
+nrow(gps_filtered_day_grid_ind)
+# [1] 3841
+
+colnames(gps_filtered_day_grid_ind)
+gps_filtered_day_grid_ind %>% 
+  group_by(id) %>%
+  summarise(gps_id = n()) %>%
+  summarise(min = min(gps_id),
+            max = max(gps_id), 
+            mean = mean(gps_id), 
+            sd = sd(gps_id)) %>% 
+  as.data.frame()  
+# min max     mean       sd              
+# 23 418 182.9048 104.2257 
+  
+table(gps_filtered_day_grid_ind$id)
+```
+
+
+## Divide into evaluation, training and test sets
+
+```{r}
+# Select points after 2018 for evaluation
+gps_filter_af2018 <- gps_filtered_day_grid_ind %>% 
+  filter(year == "af2018") 
+
+# write_sf(gps_filter_af2018, paste0(dataproc_wd, "/gps_points_eval_af2018_3035.gpkg"))
+
+# Select points before 2018 for train and test sets
+gps_bf2018 <- gps_filtered_day_grid_ind %>% 
+  filter(year == "bf2018") %>% 
+  as.data.frame() %>% 
+  droplevels()
+nrow(gps_bf2018)
+# [1] 3240
+
+# divide by individual id
+id_list <- split(gps_bf2018, gps_bf2018$id)
+id_list[1][[1]]
+
+# divide 4:1 points of each id
+for (i in 1:length(id_list)){
+  id_list[i][[1]]$fold <- kfold(id_list[i][[1]], k = 5)
+}
+
+gps_bf20182 <- do.call(rbind.data.frame, id_list)
+gps_bf20182 <- gps_bf20182[,c(1:(ncol(gps_bf20182)-2), ncol(gps_bf20182), ncol(gps_bf20182)-1)] # reorders and puts the fold in the column before the last one
+nrow(gps_bf20182)
+# [1] 3240
+
+gps_train <- gps_bf20182[gps_bf20182$fold!=5,] 
+gps_test <- gps_bf20182[gps_bf20182$fold==5,]
+
+nrow(gps_train)
+# [1] 2591
+nrow(gps_test)
+# [1] 649
+
+# plot train and test data
+pres_train_sf <- st_sf(gps_train)
+pres_test_sf <- st_sf(gps_test) 
+
+tmap_mode("view")
+tm_shape(pres_train_sf) + #filtered training gps points in color per id 
+  tm_dots("id") +
+  tm_shape(pres_test_sf) + #filtered testing gps points in light blue
+  tm_dots("lightblue")
+
+# write_sf(pres_train_sf,
+#         paste0(dataproc_wd,"/gps_points_train_bf2018_3035.gpkg"))
+# write_sf(pres_test_sf,
+#         paste0(dataproc_wd,"/gps_points_test_bf2018_3035.gpkg"))
+```
+
+
+## Background points bf 2018 for GLMM from MCPs
+
+Extract same number of bg points as presences and divide into training and testing sets
+```{r}
+# Select points before 2018 for train and test sets
+gps_bf2018 <- gps_filtered_day_grid_ind %>% 
+  filter(year == "bf2018") %>% 
+  as.data.frame() %>% 
+  droplevels()
+nrow(gps_bf2018)
+
+# add number of points to mcp object
+mcp100_bf2018_count <- gps_bf2018 %>% 
+  group_by(id) %>% 
+  summarise(n = n()) %>% 
+  as.data.frame() %>% 
+  dplyr::select(id, n) %>% 
+  ungroup() %>% 
+  right_join(gps_mcp100_bf2018, by = "id") %>% 
+  st_sf() %>% 
+  as_Spatial() # we need it as spatial object for the next function
+
+plot(mcp100_bf2018_count)
+
+nrow(mcp100_bf2018_count)
+# 18
+
+# Extract 10 times same amount of background points as presences from MCPs
+uni_id <- mcp100_bf2018_count$id
+bg_points_tmp <- list()
+
+for(i in 1:length(uni_id)){
+  bg_points_tmp[[i]] <- spsample(mcp100_bf2018_count[i,], n = as.numeric(mcp100_bf2018_count$n[i])*10, type = "random") %>%
+    as.data.frame()
+  bg_points_tmp[[i]]$id <- mcp100_bf2018_count$id[i] # add territory id
+  names(bg_points_tmp)[i] <- uni_id[i]
+}
+
+names(bg_points_tmp)
+
+bg_points_tmp2 <- as.data.frame(do.call(rbind, bg_points_tmp))
+
+# add same color as territories
+bg_points_tmp2 <- bg_points_tmp2 %>% 
+  left_join(as.data.frame(mcp95_all_sf)[,c(1,3)], by = "id") %>% 
+  droplevels() # remove id with 0 observations
+head(bg_points_tmp2)
+
+# divide again by id
+bg_id_list <- split(bg_points_tmp2, bg_points_tmp2$id)
+bg_id_list[1][[1]]
+str(bg_id_list)
+length(bg_id_list)
+# [1] 18
+
+# divide 4:1 points of each id
+for (i in 1:length(bg_id_list)){
+  bg_id_list[i][[1]]$fold <- kfold(bg_id_list[i][[1]], k = 5)
+}
+
+
+tmp2 <- do.call(rbind.data.frame, bg_id_list)
+nrow(tmp2)
+# [1] 32400
+with(tmp2, table(color, id))
+summary(tmp2)
+
+bg_train_glmm <- tmp2[tmp2$fold!=5,] 
+bg_test_glmm <- tmp2[tmp2$fold==5,]
+
+nrow(bg_train_glmm)
+# [1] 25920
+nrow(bg_test_glmm)
+# [1] 6480
+
+# make sf objects
+bg_train_glmm_sf <- st_as_sf(bg_train_glmm, coords = c("x", "y"), crs = 3035) 
+bg_test_glmm_sf <- st_as_sf(bg_test_glmm, coords = c("x", "y"), crs = 3035) 
+
+
+# select one observation per grid cell
+# extract coordinates of 1 observation per grid cell
+bg_train_glmm_grid <- gridSample(st_coordinates(bg_train_glmm_sf), # select 1 point per grid
+                           copernicus_lc_3035, 
+                           n = 1) %>%
+  as.data.frame() %>% 
+  st_as_sf(coords = c("X","Y"), # make sf object again
+           crs = 3035, 
+           sf_column_name = "geometry") %>% 
+  st_join(bg_train_glmm_sf,  # add point atributes 
+          join = st_nearest_feature,
+          left = TRUE)
+nrow(bg_train_glmm_grid)
+# [1] 24722
+
+bg_test_glmm_grid <- gridSample(st_coordinates(bg_test_glmm_sf), # select 1 point per grid
+                           copernicus_lc_3035, 
+                           n = 1) %>%
+  as.data.frame() %>% 
+  st_as_sf(coords = c("X","Y"), # make sf object again
+           crs = 3035, 
+           sf_column_name = "geometry") %>% 
+  st_join(bg_test_glmm_sf,  # add point atributes 
+          join = st_nearest_feature,
+          left = TRUE)
+
+nrow(bg_test_glmm_grid)
+# [1] 6412
+
+tmap_mode("view")
+tm_shape(bg_train_glmm_grid) + #filtered training gps points in color per id 
+  tm_dots("id") +
+  tm_shape(bg_test_glmm_grid) + #filtered testing gps points in light blue
+  tm_dots("lightblue")
+  
+# write_sf(bg_train_glmm_grid,
+#         paste0(dataproc_wd,"/bg_train_bf2018_glmm_3035_AP.gpkg"))
+# write_sf(bg_test_glmm_grid,
+#         paste0(dataproc_wd,"/bg_test_bf2018_glmm_3035_AP.gpkg"))
+```
+
+
+## Background points for maxent from MCPs.
+Before 2018 data
+Extract 10x presences number of bg points and divide into training and testing sets
+
+```{r}
+# create empty raster based on env raster
+raster0 <- raster(env_stack$HFP2009_int)
+
+# create MCP layer with values 0.99 for MCPs
+gps_mcp100_bf2018$value <- 0.99
+str(gps_mcp100_bf2018)
+
+# give values of 0.01 to cells outside 100% MCPs and 0.99 to 100% MCP cells
+raster_mcp_tmp <- fasterize(gps_mcp100_bf2018, raster = raster0, field = "value",  
+                            background = 0.01, fun = "min")
+
+plot(raster_mcp_tmp)
+
+# we crop to Germany 
+raster_mcp_bg <- mask(raster_mcp_tmp, germany_3035)
+plot(raster_mcp_bg)
+plot(st_geometry(gps_mcp100_bf2018), add = TRUE)
+
+
+# extract 10x presences
+nrow(gps_bf2018)
+
+bg_mcp_maxent <- xyFromCell(raster_mcp_bg, sample(which(!is.na(values(raster_mcp_bg))), size = nrow(gps_bf2018)*10,
+                                         prob=values(raster_mcp_bg)[!is.na(values(raster_mcp_bg))]))
+
+
+# inspect result by plotting
+plot(env_stack$HFP2009_int, legend=FALSE)
+plot(st_geometry(gps_mcp100_bf2018), add = TRUE, cex=0.3)
+points(bg_mcp_maxent, cex=0.3, col = "red")
+# write.csv(bg_mcp_maxent, paste0(dataproc_wd,"/bg_all_bf2018_maxent_mcp_3035_AP.csv"), row.names = FALSE)
+
+head(bg_mcp_maxent)
+plot(bg_mcp_maxent)
+
+# divide 4:1 points for train and test
+bg_mcp_maxent$fold <- kfold(bg_mcp_maxent, k = 5)
+head(bg_mcp_maxent)
+
+bg_train_maxent_mcp <- bg_mcp_maxent[bg_mcp_maxent$fold!=5,] 
+bg_test_maxent_mcp <- bg_mcp_maxent[bg_mcp_maxent$fold==5,]
+
+nrow(bg_train_maxent_mcp)
+# [1] 25920
+nrow(bg_test_maxent_mcp)
+# [1] 6480
+
+# make sf objects
+bg_train_maxent_mcp_sf <- st_as_sf(bg_train_maxent_mcp, coords = c("x", "y"), crs = 3035) 
+bg_test_maxent_mcp_sf <- st_as_sf(bg_test_maxent_mcp, coords = c("x", "y"), crs = 3035) 
+
+
+# select one observation per grid cell
+bg_train_mcp_maxent_grid <- gridSample(st_coordinates(bg_train_maxent_mcp_sf), # select 1 point per grid
+                           copernicus_lc_3035, 
+                           n = 1) %>%
+  as.data.frame() %>% 
+  st_as_sf(coords = c("X","Y"), # make sf object again
+           crs = 3035, 
+           sf_column_name = "geometry") %>% 
+  st_join(bg_train_maxent_mcp_sf,  # add point atributes 
+          join = st_nearest_feature,
+          left = TRUE)
+nrow(bg_train_mcp_maxent_grid)
+# [1] 25920
+
+bg_test_maxent_mcp_grid <- gridSample(st_coordinates(bg_test_maxent_mcp_sf), # select 1 point per grid
+                           copernicus_lc_3035, 
+                           n = 1) %>%
+  as.data.frame() %>% 
+  st_as_sf(coords = c("X","Y"), # make sf object again
+           crs = 3035, 
+           sf_column_name = "geometry") %>% 
+  st_join(bg_test_maxent_mcp_sf,  # add point atributes 
+          join = st_nearest_feature,
+          left = TRUE)
+nrow(bg_test_maxent_mcp_grid)
+# [1] 6480
+
+
+tmap_mode("view")
+tm_shape(bg_train_mcp_maxent_grid) + #filtered training gps points in color per id 
+  tm_dots("red") +
+  tm_shape(bg_test_maxent_mcp_grid) + #filtered testing gps points in light blue
+  tm_dots("lightblue")
+  
+# write_sf(bg_train_mcp_maxent_grid,
+#         paste0(dataproc_wd,"/bg_train_bf2018_maxent_mcp_3035_AP.gpkg"))
+# write_sf(bg_test_maxent_mcp_grid,
+#         paste0(dataproc_wd,"/bg_test_bf2018_maxent_mcp_3035_AP.gpkg"))
+```
+
+
+####################
+## territory data ##
+####################
+
+These are the centroids of the territories found during wolf monitoring in Germany.
+
+### Load and check territories
+```{r}
+# load all GPS data for resident adults
+terr_sf <- st_read(paste0(dataproc_wd, "/territory_points_3035.gpkg"))
+terr_sf
+nrow(terr_sf)
+# [1] 562
+
+# basic summaries
+terr_summary <- terr_sf %>%
+  as.data.frame() %>% 
+  dplyr::select(-geom) %>% 
+  group_by(Mjahr) %>%
+  summarise(n = n()) 
+terr_summary
+# 106 territories in 2018, and 
+sum(terr_summary$n) - 106
+# 456 territories bf 2018
+
+## Plot the locations color-coded by year
+tmap_mode("view")
+tm_shape(terr_sf) +
+  tm_dots("Mjahr", palette = c("yellow", "orange", "chocolate", "red", "blue"),
+          breaks = c(2000, 2005, 2010, 2015, 2018, 2020))
+```
+
+
+## Create bg points for combined model
+
+presences in mcp, bg in territories
+
+The random points here are created using the same bias raster as before, because they use the territories
+Only changes the number of random points, now 10x presences in MCPs
+We sample random points using a bias raster with 0.99 probability in 10 km buffer around the centroids and 0.01 prob in the rest
+
+```{r}
+# Number of presences
+
+pres_points_mcp_maxent_bf2018 <- rbind(pres_train_sf, pres_test_sf)
+nrow(pres_points_mcp_maxent_bf2018)
+# [1] 3240
+
+# Paralellize the selection of random points (library parallel)
+no_cores <- detectCores()/2 - 2 # divide by two detect cores instead of threads
+cl <- makeCluster(no_cores)
+
+npoints <- rep(nrow(pres_points_mcp_maxent_bf2018)*10/12, 12)
+raster_terr_bg
+extent_to_use <- extent(as(germany_3035, "Spatial"))
+
+my_function <- function(npoints){
+  dismo::randomPoints(mask = raster_terr_bg,
+                      ext = extent_to_use,
+                      n = npoints,
+                      prob = T)
+}
+
+clusterExport(cl, c("raster_terr_bg", "extent_to_use")) # Copy objects to all cores
+clusterEvalQ(cl, library("dismo")) # copy libraries to all cores
+res.list <- parLapply(cl, npoints, my_function) # Apply parallel functions
+stopCluster(cl) # stop parallelization
+
+# Paste all results in the same dataframe
+res.df <- do.call("rbind", res.list)
+nrow(res.df)
+# [1] 32400
+
+res.df2 <- st_as_sf(as.data.frame(res.df), coords = c("x", "y"))
+nrow(res.df2)
+# 1] 32400
+
+# divide 4:1 points for train and test
+res.df2$fold <- kfold(res.df2, k = 5)
+head(res.df2)
+
+bg_train_maxent_comb <- res.df2[res.df2$fold!=5,] 
+bg_test_maxent_comb <- res.df2[res.df2$fold==5,]
+
+nrow(bg_train_maxent_comb)
+# [1] 25920
+nrow(bg_test_maxent_comb)
+# [1] 6480
+
+# make sf objects
+bg_train_maxent_comb_sf <- st_as_sf(bg_train_maxent_comb, coords = c("x", "y"), crs = 3035) 
+bg_test_maxent_comb_sf <- st_as_sf(bg_test_maxent_comb, coords = c("x", "y"), crs = 3035) 
+
+# select one observation per grid cell
+bg_train_maxent_comb_grid <- gridSample(st_coordinates(bg_train_maxent_comb_sf), # select 1 point per grid
+                           copernicus_lc_3035, 
+                           n = 1) %>%
+  as.data.frame() %>% 
+  st_as_sf(coords = c("X","Y"), # make sf object again
+           crs = 3035, 
+           sf_column_name = "geometry") 
+
+nrow(bg_train_maxent_comb_grid)
+# 25843
+
+bg_test_maxent_comb_grid <- gridSample(st_coordinates(bg_test_maxent_comb_sf), # select 1 point per grid
+                           copernicus_lc_3035, 
+                           n = 1) %>%
+  as.data.frame() %>% 
+  st_as_sf(coords = c("X","Y"), # make sf object again
+           crs = 3035, 
+           sf_column_name = "geometry") 
+  
+nrow(bg_test_maxent_comb_grid)
+# 6474
+
+# write_sf(bg_train_maxent_comb_grid,
+#          paste0(dataproc_wd,"/bg_train_bf2018_maxent_comb_3035_AP.gpkg"))
+# write_sf(bg_test_maxent_comb_grid,
+#         paste0(dataproc_wd,"/bg_test_bf2018_maxent_comb_3035_AP.gpkg"))
+```
+
+
+#############################
+## evaluation sets >= 2018 ##
+#############################
+
+All of the points used as "test set 2"
+
+## GLMM - MCP Individual data
+
+Background points bf 2018 for GLMM from MCPs
+Extract 10x presences as bg points test sets 2
+```{r}
+str(gps_filter_af2018)
+nrow(gps_filter_af2018)
+# [1] 601
+
+## Calculate 100 MCPs for each individual after 2018
+mcp_af2018_dataframe <- gps_filter_af2018 %>%
+  as.data.frame() %>%
+  dplyr::select(id) %>% 
+  droplevels()
+mcp_af2018_dataframe <- cbind(mcp_af2018_dataframe, st_coordinates(gps_filter_af2018))
+head(mcp_af2018_dataframe)
+nrow(mcp_af2018_dataframe)
+# [1] 601 # locations before 2018
+table(mcp_af2018_dataframe$id) # 5 ids
+
+coordinates(mcp_af2018_dataframe) <- c("X", "Y")
+proj4string(mcp_af2018_dataframe) <- CRS( "+init=epsg:3035" )
+
+mcp100_af2018 <- mcp(mcp_af2018_dataframe, percent = 100)
+mcp100_af2018
+nrow(mcp100_af2018)
+# [1] 5
+gps_mcp100_af2018 <- st_as_sf(mcp100_af2018, crs = 3035)
+plot(st_geometry(gps_mcp100_af2018))
+# write_sf(gps_mcp100_af2018, paste0(dataproc_wd, "/gps_MCP100_adults_after2018_3035.gpkg"))
+
+# area of MCPs:
+mcp100_af2018_km2 <- st_area(gps_mcp100_af2018)/1000000
+
+mcps_af2018_averages <- mcp100_af2018_km2 %>%
+  as.data.frame() %>% 
+  summarise(across(everything(), list(mean = mean, sd = sd, 
+                                      median = median, 
+                                      min = min, max = max))) %>% 
+  t()
+
+# add number of points to mcp object
+mcp100_af2018_count <- gps_filter_af2018 %>% 
+  group_by(id) %>% 
+  summarise(n = n()) %>% 
+  as.data.frame() %>% 
+  dplyr::select(id, n) %>% 
+  ungroup() %>% 
+  right_join(gps_mcp100_af2018, by = "id") %>% 
+  st_sf() %>% 
+  as_Spatial() # we need it as spatial object for the next function
+
+# Extract 10 times same amount of background points as presences from MCPs
+uni_id <- mcp100_af2018_count$id
+bg_points_af2018_tmp <- list()
+
+for(i in 1:length(uni_id)){
+  bg_points_af2018_tmp[[i]] <- spsample(mcp100_af2018_count[i,], n = as.numeric(mcp100_af2018_count$n[i])*10, 
+                                        type = "random") %>%
+    as.data.frame()
+  bg_points_af2018_tmp[[i]]$id <- mcp100_af2018_count$id[i] # add territory id
+  names(bg_points_af2018_tmp)[i] <- uni_id[i]
+}
+
+names(bg_points_af2018_tmp)
+
+bg_points_af2018_tmp2 <- as.data.frame(do.call(rbind, bg_points_af2018_tmp))
+
+# add same color as territories
+bg_points_af2018_tmp2 <- bg_points_af2018_tmp2 %>% 
+  left_join(as.data.frame(mcp95_all_sf)[,c(1,3)], by = "id") %>% 
+  droplevels() # remove id with 0 observations
+
+# make sf objects
+bg_test_af2018_sf <- st_as_sf(bg_points_af2018_tmp2, coords = c("x", "y"), crs = 3035) 
+
+# select one observation per grid cell
+# extract coordinates of 1 observation per grid cell
+bg_test_af2018_glmm_grid <- gridSample(st_coordinates(bg_test_af2018_sf), # select 1 point per grid
+                           copernicus_lc_3035, 
+                           n = 1) %>%
+  as.data.frame() %>% 
+  st_as_sf(coords = c("X","Y"), # make sf object again
+           crs = 3035, 
+           sf_column_name = "geometry") %>% 
+  st_join(bg_test_af2018_sf,  # add point atributes 
+          join = st_nearest_feature,
+          left = TRUE)
+nrow(bg_test_af2018_glmm_grid)
+# [1] 5805
+
+tmap_mode("plot")
+tm_shape(as_Spatial(mcp95_all_sf)) +
+  tm_borders(col = mcp95_all_sf$color) +
+tm_shape(as_Spatial(bg_test_af2018_glmm_grid)) + #filtered test after 2018 points  
+  tm_dots(col = bg_test_af2018_glmm_grid$color) 
+
+# get colors with 0.2 alpha manually (Change last FF for 33)
+my_colors <- paste0(str_sub(mcp95_all_sf$color, 1, 7), "33")
+
+plot(st_geometry(mcp95_all_sf), col = my_colors)
+plot(st_geometry(bg_test_af2018_glmm_grid), col = bg_test_af2018_glmm_grid$color, 
+     pch = 1, cex = 0.1, add = TRUE)
+
+# write_sf(bg_test_af2018_glmm_grid,
+#         paste0(dataproc_wd,"/bg_test2_af2018_glmm_3035_AP.gpkg"))
+```
+
+
+## Maxent / Ensemble - MCP data
+```{r}
+# create a raster to assign probability values in the cells, using environmental data as template
+raster0 <- raster(env_stack$HFP2009_int)
+
+# create MCP layer with values 0.99 for MCPs
+gps_mcp100_af2018$value <- 0.99
+str(gps_mcp100_af2018)
+
+# give values of 0.01 to cells outside 100% MCPs and 0.99 to 100% MCP cells
+raster_mcp_af2018_tmp <- fasterize(gps_mcp100_af2018, raster = raster0, field = "value",  
+                            background = 0.01, fun = "max")
+
+plot(raster_mcp_af2018_tmp)
+
+# we crop to Germany 
+raster_mcp_af2018_bg <- mask(raster_mcp_af2018_tmp, germany_3035)
+plot(raster_mcp_af2018_bg)
+plot(st_geometry(gps_mcp100_af2018), add = TRUE)
+
+# extract 10x presences
+nrow(gps_filter_af2018) #[1] 601
+
+bg_mcp_af2018_maxent <- xyFromCell(raster_mcp_af2018_bg, sample(which(!is.na(values(raster_mcp_af2018_bg))), 
+                                                                size = nrow(gps_filter_af2018)*10,
+                                                                prob=values(raster_mcp_af2018_bg)[!is.na(values(raster_mcp_af2018_bg))]))
+
+# inspect result by plotting
+plot(env_stack$HFP2009_int, legend=FALSE)
+plot(st_geometry(gps_mcp100_af2018), add = TRUE, cex=0.3)
+points(bg_mcp_af2018_maxent, cex=0.3, col = "red")
+
+nrow(bg_mcp_af2018_maxent) # [1] 6010
+
+head(bg_mcp_af2018_maxent)
+plot(bg_mcp_af2018_maxent)
+
+# make sf objects
+bg_test2_af2018_maxent_mcp_sf <- bg_mcp_af2018_maxent %>% 
+  as.data.frame() %>% 
+  st_as_sf(coords = c("x", "y"), crs = 3035)
+
+# select one observation per grid cell
+bg_test2_af2018_mcp_maxent_grid <- gridSample(st_coordinates(bg_test2_af2018_maxent_mcp_sf), # select 1 point per grid
+                           copernicus_lc_3035, 
+                           n = 1) %>%
+  as.data.frame() %>% 
+  st_as_sf(coords = c("X","Y"), # make sf object again
+           crs = 3035, 
+           sf_column_name = "geometry") 
+nrow(bg_test2_af2018_mcp_maxent_grid)
+# [1] 6010
+
+tm_shape(mcp100_af2018) + #filtered training gps points in color per id 
+  tm_dots("red") +
+  tm_shape(bg_test2_af2018_mcp_maxent_grid) + #filtered testing gps points in light blue
+  tm_dots("lightblue")
+  
+# write_sf(bg_test2_af2018_mcp_maxent_grid,
+#         paste0(dataproc_wd,"/bg_test2_af2018_maxent_mcp_3035_AP.gpkg"))
+```
+
+## Maxent / ensemble - Combined data
+
+presences in mcp, bg in territories
+
+The random points here are created using the same bias raster as before, because they use the territories
+Only changes the number of random points, now 10x presences in MCPs
+We sample random points using a bias raster with 0.99 probability in 10 km buffer around the centroids and 0.01 prob in the rest
+
+```{r}
+# Load presences
+gps_filter_af2018 <- st_read(paste0(dataproc_wd, "/gps_points_eval_af2018_3035.gpkg"))
+raster_terr_bg_af2018 <- raster(paste0(workDir, "/output/geo-proc/raster_bias_terr_af2018_100m_3035.tif"))
+
+nrow(gps_filter_af2018)
+# [1] 601
+
+# Paralellize the selection of random points (library parallel)
+no_cores <- detectCores()/2 - 2 # divide by two detect cores instead of threads
+cl <- makeCluster(no_cores)
+
+npoints <- rep(nrow(gps_filter_af2018), 10)
+raster_terr_bg_af2018
+extent_to_use <- extent(as(germany_3035, "Spatial"))
+
+my_function <- function(npoints){
+  dismo::randomPoints(mask = raster_terr_bg_af2018,
+                      ext = extent_to_use,
+                      n = npoints,
+                      prob = T)
+}
+
+clusterExport(cl, c("raster_terr_bg_af2018", "extent_to_use")) # Copy objects to all cores
+clusterEvalQ(cl, library("dismo")) # copy libraries to all cores
+res.list <- parLapply(cl, npoints, my_function) # Apply parallel functions
+stopCluster(cl) # stop parallelization
+
+# Paste all results in the same dataframe
+res.df <- do.call("rbind", res.list)
+nrow(res.df)
+# [1] 6010
+
+res.df2 <- st_as_sf(as.data.frame(res.df), coords = c("x", "y"))
+nrow(res.df2)
+# 1] 6010
+
+# make sf objects
+bg_test2_af2018_maxent_comb_sf <- st_as_sf(res.df2, coords = c("x", "y"), crs = 3035) 
+
+# select one observation per grid cell
+bg_test2_af2018_maxent_comb_grid <- gridSample(st_coordinates(bg_test2_af2018_maxent_comb_sf), # select 1 point per grid
+                           copernicus_lc_3035, 
+                           n = 1) %>%
+  as.data.frame() %>% 
+  st_as_sf(coords = c("X","Y"), # make sf object again
+           crs = 3035, 
+           sf_column_name = "geometry") 
+
+nrow(bg_test2_af2018_maxent_comb_grid)
+# 6009
+
+# inspect result by plotting
+# plot(env_stack$HFP2009_int, legend=FALSE)
+plot(germany_3035, add = TRUE)
+plot(st_geometry(bg_test2_af2018_maxent_comb_grid), add = TRUE, cex=0.3, col = "red")
+
+# write_sf(bg_test2_af2018_maxent_comb_grid,
+#          paste0(dataproc_wd,"/bg_test2_af2018_maxent_comb_3035_AP.gpkg"))
+```
+
+
+
