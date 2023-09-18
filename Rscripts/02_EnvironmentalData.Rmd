@@ -1,0 +1,403 @@
+---
+title: "env_exploration"
+author: "Aimara Planillo"
+date: "2/8/2021"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Exploring environmental layers
+
+```{r prepare workspace}
+## packages
+source("./R/source_file.R")
+
+## work directories
+workDir <- getwd()
+
+dataproc_wd <- paste0(workDir, "/output/data_proc")
+geoproc_wd <- paste0(workDir, "/output/geo_proc")
+results_wd <- paste0(workDir, "/output/results")
+```
+
+
+### Load environmental layers
+```{r}
+## Border of Germany
+germany_3035 <- read_sf(paste0(geoproc_wd, "/germany_3035.gpkg"), crs = 3035) 
+
+## env stack
+env_stack <- stack(paste0(geoproc_wd, "/stack_all_env_vars_20181220.tif"))
+# add names to the stack
+names(env_stack) <- c("g100_clc12_V18_5", "popu01clcv5", "mos2_dist_settlments", "mos2_dist_streets", "HFP2009_int")
+
+# Correct land use classes to seven classes
+env_stack$g100_clc12_V18_5[env_stack$g100_clc12_V18_5 == 103] <- 102
+
+unique(env_stack$g100_clc12_V18_5)
+
+plot(env_stack$mos2_dist_settlments)
+
+plot(st_geometry(germany_3035), add = TRUE)
+
+# mask the environmental layers to Germany and 10km buffer around
+env_germany <- mask(env_stack, germany_3035 %>% st_buffer(10000))
+
+# rename and reorganize to follow the order of the paper
+names(env_germany) <- c("CLC2012", "Pop_den", "Dist_settl", "Dist_roads", "HFP") 
+
+
+plot(env_germany)
+plot(env_germany$Dist_settl)
+plot(st_geometry(germany_3035), add = TRUE)
+# unique(env_germany$CLC2012)
+
+plot(env_germany$Dist_roads)
+plot(st_geometry(germany_3035), add = TRUE)
+
+
+# rename and reorganize to follow the order of the paper
+env_germany <- stack(env_germany[[1]],env_germany[[2]],env_germany[[5]],
+                    env_germany[[3]], env_germany[[4]])
+```
+
+
+### Correlation among the layers
+```{r}
+# pairwise correlation of the rasters
+rasters_cor <- layerStats(env_germany, 'pearson', na.rm=T)
+corr_matrix <- rasters_cor$'pearson correlation coefficient'
+corr_matrix
+
+corr_matrix[corr_matrix > 0.5 | corr_matrix < -0.5] 
+
+# save data
+write.csv(corr_matrix, paste0(results_wd, "/env_corr_matrix_pearson.csv"), row.names = TRUE)
+corr_matrix <- read.csv(paste0(results_wd, "/env_corr_matrix_pearson.csv"), row.names = 1) %>%  as.matrix()
+```
+
+
+
+# Extract env variables for presences
+
+We need this explicitly for the GLMM models, 
+but we do it for all to get the values for the summary tables
+
+## Presence points 
+## Env cov for Presences bf 2018
+```{r}
+# load GPS telemetry presences
+pres_train_gps_sf <- st_read(paste0(dataproc_wd,"/gps_points_train_bf2018_3035.gpkg")) %>% 
+  st_transform(crs = 3035) %>% 
+  mutate(type = "train")
+pres_test_gps_sf <- st_read(paste0(dataproc_wd,"/gps_points_test_bf2018_3035.gpkg")) %>% 
+  st_transform(crs = 3035) %>% 
+  mutate(type = "test")
+
+pres_gps <- rbind(pres_train_gps_sf, pres_test_gps_sf)
+pres_gps
+plot(st_geometry(pres_gps))
+nrow(pres_gps) #[1] 3240
+
+# extract env cov for the points
+pres_gps_envcov <- raster::extract(env_germany, pres_gps, sp = TRUE)
+summary(pres_gps_envcov)
+nrow(pres_gps_envcov) #[1] 3240
+
+pres_gps_envcov_sf <- st_as_sf(pres_gps_envcov)
+# write_sf(pres_gps_envcov_sf, paste0(dataproc_wd, "/envcov_pres_telemetry.gpkg"))
+
+## Get the summaries
+pres_gps_envcov_sf$CLC2012[which.max(pres_gps_envcov_sf$CLC2012)]
+
+(summary_pres_gps_envcov <- pres_gps_envcov_sf %>%
+  as.data.frame() %>% 
+  group_by(type) %>%
+  summarise(npoints = n(), 
+            land_use = getmode(CLC2012),
+            across(Pop_den:Dist_roads, 
+                   list(min = min, max = max, mean = mean, 
+                        median = median, sd = sd), na.rm= TRUE)) %>% 
+  mutate(data_source = "telemetry_filtered_presences")
+)
+```
+
+## Env cov for Presences af 2018
+```{r}
+# load GPS telemetry presences
+gps_mcp_test2_af2018 <- st_read(paste0(dataproc_wd, "/gps_points_eval_af2018_3035.gpkg")) %>% 
+  st_transform(crs = 3035)
+  
+nrow(gps_mcp_test2_af2018) #[1] 601
+
+# extract env cov for the points
+pres_gps_af2018_envcov <- raster::extract(env_germany, gps_mcp_test2_af2018, sp = TRUE)
+summary(pres_gps_af2018_envcov)
+nrow(pres_gps_af2018_envcov) #[1] 601
+
+pres_gps_af2018_envcov_sf <- st_as_sf(pres_gps_af2018_envcov)
+# write_sf(pres_gps_af2018_envcov_sf, paste0(dataproc_wd, "/envcov_pres_telemetry_af2018.gpkg"))
+
+## Get the summaries
+(summary_pres_gps_af2018_envcov <- pres_gps_af2018_envcov_sf %>%
+  as.data.frame() %>% 
+  # group_by(type) %>%
+  summarise(type = "test2", 
+            npoints = n(), 
+            land_use = getmode(CLC2012),
+            across(Pop_den:Dist_roads, 
+                   list(min = min, max = max, mean = mean, 
+                        median = median, sd = sd), na.rm= TRUE)) %>% 
+  mutate(data_source = "telemetry_filtered_presences_af2018")
+)
+```
+
+
+## Background points 
+
+### Env cov for background mcp for glmm bf 2018
+
+```{r}
+# Load Background points MCP GLMM
+bg_train_glmm_sf <- st_read(paste0(dataproc_wd,"/bg_train_bf2018_glmm_3035_AP.gpkg")) %>% 
+  st_transform(crs = 3035) %>% 
+  mutate(type = "train")
+plot(germany_3035)
+plot(st_geometry(bg_train_glmm_sf), add = TRUE)
+bg_test_glmm_sf <- st_read(paste0(dataproc_wd,"/bg_test_bf2018_glmm_3035_AP.gpkg")) %>% 
+  st_transform(crs = 3035) %>% 
+  mutate(type = "test")
+
+bg_mcp_glmm <- rbind(bg_train_glmm_sf, bg_test_glmm_sf)
+bg_mcp_glmm
+plot(st_geometry(bg_mcp_glmm))
+nrow(bg_mcp_glmm) #[1] 31134
+
+bg_mcp_glmm_envcov <- raster::extract(env_germany, bg_mcp_glmm, sp = TRUE)
+summary(bg_mcp_glmm_envcov)
+nrow(bg_mcp_glmm_envcov) #[1] 31134
+
+bg_mcp_glmm_envcov_sf <- st_as_sf(bg_mcp_glmm_envcov)
+# write_sf(bg_mcp_glmm_envcov_sf, paste0(dataproc_wd, "/envcov_bg_mcp_glmm.gpkg"))
+
+## Get the summaries
+(summary_bg_mcp_glmm_envcov <- bg_mcp_glmm_envcov_sf %>%
+  as.data.frame() %>% 
+  group_by(type) %>%
+  summarise(npoints = n(), 
+            land_use = getmode(CLC2012),
+            across(Pop_den:Dist_roads, 
+                   list(min = min, max = max, mean = mean, 
+                        median = median, sd = sd), na.rm= TRUE)) %>% 
+  mutate(data_source = "bg_mcp_glmm")
+)
+```
+
+### Env cov for background mcp for telemetry maxent / ensemble bf 2018
+
+```{r}
+# Load Background points MCP maxent / ensemble
+bg_train_maxent_mcp_sf <- st_read(paste0(dataproc_wd,"/bg_train_bf2018_maxent_mcp_3035_AP.gpkg")) %>% 
+   st_transform(crs = 3035) %>% 
+  mutate(type = "train")
+bg_test_maxent_mcp_sf <- st_read(paste0(dataproc_wd,"/bg_test_bf2018_maxent_mcp_3035_AP.gpkg")) %>% 
+   st_transform(crs = 3035) %>% 
+  mutate(type = "test")
+
+bg_mcp_maxent <- rbind(bg_train_maxent_mcp_sf, bg_test_maxent_mcp_sf)
+bg_mcp_maxent
+plot(st_geometry(bg_mcp_maxent))
+nrow(bg_mcp_maxent) #[1] 32400
+
+bg_mcp_maxent_envcov <- raster::extract(env_germany, bg_mcp_maxent, sp = TRUE)
+summary(bg_mcp_maxent_envcov)
+nrow(bg_mcp_maxent_envcov) #[1] 32400
+
+bg_mcp_maxent_envcov_sf <- st_as_sf(bg_mcp_maxent_envcov)
+# write_sf(bg_mcp_maxent_envcov_sf, paste0(dataproc_wd, "/envcov_bg_mcp_maxent.gpkg"))
+
+
+## Get the summaries
+(summary_bg_mcp_maxent_envcov <- bg_mcp_maxent_envcov_sf %>%
+  as.data.frame() %>% 
+  group_by(type) %>%
+  summarise(npoints = n(), 
+            land_use = getmode(CLC2012),
+            across(Pop_den:Dist_roads, 
+                   list(min = min, max = max, mean = mean, 
+                        median = median, sd = sd), na.rm= TRUE)) %>% 
+    mutate(data_source = "bg_mcp_maxent")
+)
+```
+
+### Env cov for background mcp for combined maxent / ensemble bf 2018
+
+```{r}
+# Load Background points combined maxent
+bg_train_maxent_comb_sf <- st_read(paste0(dataproc_wd,"/bg_train_bf2018_maxent_comb_3035_AP.gpkg")) %>% 
+   st_transform(crs = 3035) %>% 
+  mutate(type = "train")
+bg_test_maxent_comb_sf <- st_read(paste0(dataproc_wd,"/bg_test_bf2018_maxent_comb_3035_AP.gpkg")) %>% 
+   st_transform(crs = 3035) %>% 
+  mutate(type = "test")
+
+bg_comb_maxent <- rbind(bg_train_maxent_comb_sf, bg_test_maxent_comb_sf)
+bg_comb_maxent
+plot(st_geometry(bg_comb_maxent))
+nrow(bg_comb_maxent) #[1] 32317
+
+bg_comb_maxent_envcov <- raster::extract(env_germany, bg_comb_maxent, sp = TRUE)
+summary(bg_comb_maxent_envcov)
+nrow(bg_comb_maxent_envcov) #[1] 32317
+
+bg_comb_maxent_envcov_sf <- st_as_sf(bg_comb_maxent_envcov)
+# write_sf(bg_comb_maxent_envcov_sf, paste0(dataproc_wd, "/envcov_bg_combined_maxent.gpkg"))
+
+## Get the summaries
+(summary_bg_comb_maxent_envcov <- bg_comb_maxent_envcov_sf %>%
+  as.data.frame() %>% 
+  group_by(type) %>%
+  summarise(npoints = n(), 
+            land_use = getmode(CLC2012),
+            across(Pop_den:Dist_roads, 
+                   list(min = min, max = max, mean = mean, 
+                        median = median, sd = sd), na.rm= TRUE)) %>% 
+    mutate(data_source = "bg_comb_maxent")
+)
+```
+
+### Env cov for background points after 2018
+
+```{r}
+# Load Background points MCP GLMM
+bg_test_af2018_glmm_sf <- st_read(paste0(dataproc_wd,"/bg_test2_af2018_glmm_3035_AP.gpkg"))
+nrow(bg_test_af2018_glmm_sf) #[1] 5805
+
+bg_mcp_glmm_test2_envcov <- raster::extract(env_germany, bg_test_af2018_glmm_sf, sp = TRUE)
+summary(bg_mcp_glmm_test2_envcov)
+nrow(bg_mcp_glmm_test2_envcov) #[1] 5805
+
+bg_mcp_af2018_glmm_envcov_sf <- st_as_sf(bg_mcp_glmm_test2_envcov)
+# write_sf(bg_mcp_glmm_envcov_sf, paste0(dataproc_wd, "/envcov_bg_mcp_glmm_af2018.gpkg"))
+
+## Get the summaries
+(summary_bg_mcp_glmm_af2018_envcov <- bg_mcp_af2018_glmm_envcov_sf %>%
+  as.data.frame() %>% 
+  # group_by(type) %>%
+  summarise(type = "test2", 
+            npoints = n(), 
+            land_use = getmode(CLC2012),
+            across(Pop_den:Dist_roads, 
+                   list(min = min, max = max, mean = mean, 
+                        median = median, sd = sd), na.rm= TRUE)) %>% 
+  mutate(data_source = "bg_mcp_glmm_af2018")
+)
+
+
+# Load Background points MCP maxent / ensemble
+bg_test_af2018_maxent_mcp_sf <- st_read(paste0(dataproc_wd,"/bg_test2_af2018_maxent_mcp_3035_AP.gpkg")) %>% 
+   st_transform(crs = 3035) 
+nrow(bg_test_af2018_maxent_mcp_sf) #[1] 6010
+
+bg_af2018_mcp_maxent_envcov <- raster::extract(env_germany, bg_test_af2018_maxent_mcp_sf, sp = TRUE)
+summary(bg_af2018_mcp_maxent_envcov)
+nrow(bg_af2018_mcp_maxent_envcov) #[1] 6010
+
+bg_af2018_mcp_maxent_envcov_sf <- st_as_sf(bg_af2018_mcp_maxent_envcov)
+# write_sf(bg_af2018_mcp_maxent_envcov_sf, paste0(dataproc_wd, "/envcov_bg_mcp_maxent_af2018.gpkg"))
+
+## Get the summaries
+(summary_bg_mcp_maxent_af2018_envcov <- bg_af2018_mcp_maxent_envcov_sf %>%
+  as.data.frame() %>% 
+  # group_by(type) %>%
+  summarise(type = "test2", 
+            npoints = n(), 
+            land_use = getmode(CLC2012),
+            across(Pop_den:Dist_roads, 
+                   list(min = min, max = max, mean = mean, 
+                        median = median, sd = sd), na.rm= TRUE)) %>% 
+    mutate(data_source = "bg_mcp_maxent_af2018")
+)
+
+
+# Load Background points af2018 combined maxent
+bg_test2_af2018_maxent_comb_sf <- st_read(paste0(dataproc_wd,"/bg_test2_af2018_maxent_comb_3035_AP.gpkg")) %>% 
+   st_transform(crs = 3035) 
+nrow(bg_test2_af2018_maxent_comb_sf) #[1] 6009
+
+bg_af2018_comb_maxent_envcov <- raster::extract(env_germany, bg_test2_af2018_maxent_comb_sf, sp = TRUE)
+summary(bg_af2018_comb_maxent_envcov)
+nrow(bg_af2018_comb_maxent_envcov) #[1] 6009
+
+bg_af2018_comb_maxent_envcov_sf <- st_as_sf(bg_af2018_comb_maxent_envcov)
+# write_sf(bg_af2018_comb_maxent_envcov_sf, paste0(dataproc_wd, "/envcov_bg_comb_maxent_af2018.gpkg"))
+
+## Get the summaries
+(summary_bg_comb_maxent_af2018_envcov <- bg_af2018_comb_maxent_envcov_sf %>%
+  as.data.frame() %>% 
+  # group_by(type) %>%
+  summarise(type = "test2", 
+            npoints = n(), 
+            land_use = getmode(CLC2012),
+            across(Pop_den:Dist_roads, 
+                   list(min = min, max = max, mean = mean, 
+                        median = median, sd = sd), na.rm= TRUE)) %>% 
+    mutate(data_source = "bg_comb_maxent_af2018")
+)
+```
+
+
+
+## Summary of all points
+
+```{r}
+summary_allpoints <- rbind(summary_pres_gps_envcov, summary_pres_gps_af2018_envcov, 
+                           summary_bg_mcp_glmm_envcov, summary_bg_mcp_maxent_envcov,
+                           summary_bg_comb_maxent_envcov, 
+                           summary_bg_mcp_glmm_af2018_envcov, summary_bg_mcp_maxent_af2018_envcov,
+                           summary_bg_comb_maxent_af2018_envcov)
+
+# write.csv(summary_allpoints, paste0(dataproc_wd, "/Table_envcov_extract_summary.csv"),
+#          row.names = FALSE)
+```
+
+```{r get summaries per variable}
+summary_allpoints[,grep("land_use", colnames(summary_allpoints))]
+summary_allpoints[,grep("Pop", colnames(summary_allpoints))]
+summary_allpoints[,grep("HFP", colnames(summary_allpoints))]
+summary_allpoints[,grep("sett", colnames(summary_allpoints))]
+summary_allpoints[,grep("roads", colnames(summary_allpoints))]
+```
+
+
+## Plot env values to inspect them
+```{r}
+# check values 
+summary(env_germany)
+
+# fast plotting: library quickplot
+Plot(env_germany, new = TRUE)
+
+# Highlight NA values in black
+Plot(env_germany)
+
+clearPlot()
+
+# give color palette for each map
+mapColours <- list(
+  CLC2012 = brewer.pal(8, "Spectral"), 
+  Pop_den = brewer.pal(8, "Spectral"), 
+  HFP = brewer.pal(8, "Spectral"), 
+  Dist_settl = brewer.pal(8, "Spectral"), 
+  Dist_roads = brewer.pal(8, "Spectral"))
+setColors(env_germany, n = 8) <- mapColours
+
+Plot(env_germany, new = TRUE, na.color = "black")
+```
+
+
