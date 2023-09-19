@@ -15,7 +15,7 @@ knitr::opts_chunk$set(echo = TRUE)
 
 ```{r prepare workspace}
 ## packages
-source("./R/source_file.R")
+source("./Rscripts/source_file_packages.R")
 
 ## work directories
 workDir <- getwd()
@@ -64,6 +64,8 @@ plot(st_geometry(germany_3035), add = TRUE)
 # rename and reorganize to follow the order of the paper
 env_germany <- stack(env_germany[[1]],env_germany[[2]],env_germany[[5]],
                     env_germany[[3]], env_germany[[4]])
+
+# writeRaster(env_germany, paste0(geoproc_wd, "/stack_env_rasters_germany_3035_AP.tif"))
 ```
 
 
