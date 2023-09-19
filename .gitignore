@@ -3,3 +3,5 @@
 .Rproj.user/
 output/
 Rscripts/tocheck
+wolf.combined/
+wolf.mcp.telemetry/
