@@ -15,9 +15,9 @@ knitr::opts_chunk$set(echo = TRUE)
 
 ### Load packages and workspace from source file
 ```{r}
-source(paste0(getwd(), "/R/source_file.R"))
+source("./Rscripts/source_file_packages.R")
 workDir <- getwd()
-dataproc_wd <- file.path(workDir, "output/data-proc")
+dataproc_wd <- file.path(workDir, "output/data_proc")
 
 set.seed(155)
 ```
@@ -631,6 +631,20 @@ tm_shape(bg_train_mcp_maxent_grid) + #filtered training gps points in color per 
 #         paste0(dataproc_wd,"/bg_train_bf2018_maxent_mcp_3035_AP.gpkg"))
 # write_sf(bg_test_maxent_mcp_grid,
 #         paste0(dataproc_wd,"/bg_test_bf2018_maxent_mcp_3035_AP.gpkg"))
+
+
+# make sf objects of all points 
+bg_maxent_mcp_sf <- rbind(bg_train_maxent_mcp_grid, bg_test_maxent_mcp_grid) 
+
+
+tmap_mode("view")
+tm_shape(bg_mcp_maxent_grid) + #filtered training gps points in color per id 
+  tm_dots("red") 
+
+# write_sf(bg_mcp_maxent_grid,
+#        paste0(dataproc_wd,"/bg_mcp_bf2018_3035_AP.gpkg"))
+
+
 ```
 
 
