@@ -1,0 +1,1995 @@
+---
+title: "models_datasources"
+author: "Aimara Planillo"
+date: "2023-05-30"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+# Run models for the different datasets
+
+
+```{r}
+source("./Rscripts/source_file_packages.R")
+
+workDir <- getwd()
+dataproc_wd <- paste0(workDir, "/output/data_proc")
+geoproc_wd <- paste0(workDir, "/output/geo_proc")
+results_wd <- paste0(workDir, "/output/results")
+
+# change java memory use in windows to 8gb so the maxent models can be run
+# options(java.parameters = "-Xmx8000m")
+```
+
+
+
+
+# GLMM model
+
+we use data **before 2018**
+- presences: telemetry data filtered by day and grid
+- background: random points (10x presences) selected in 100% MCPs, filtered by grid
+- environmental variables extracted at the point location
+- Data divide into train (80%) and test (20%) sets
+
+
+Load data
+```{r}
+# Load observations with env data
+pres_gps_envcov_sf <- st_read(paste0(dataproc_wd, "/envcov_pres_telemetry.gpkg")) %>% 
+  st_transform(crs = 3035)  
+  
+# Load background with env data
+bg_mcp_glmm_envcov_sf <- st_read(paste0(dataproc_wd, "/envcov_bg_mcp_glmm.gpkg")) %>% 
+  st_transform(crs = 3035)
+
+# put both dataset together and select training data
+pres_gps_envcov_tmp <- pres_gps_envcov_sf %>% 
+  mutate(point_case = 1) %>% 
+  dplyr::select(id, point_case, type, CLC2012, Pop_den, Dist_settl, Dist_roads, HFP) 
+
+bg_mcp_glmm_envcov_tmp <- bg_mcp_glmm_envcov_sf %>% 
+  mutate(point_case = 0) %>% 
+  dplyr::select(id, point_case, type, CLC2012, Pop_den, Dist_settl, Dist_roads, HFP) 
+
+train_glmm_envcov_tmp <- rbind(pres_gps_envcov_tmp, bg_mcp_glmm_envcov_tmp) %>% 
+  filter(type == "train")
+summary(train_glmm_envcov_tmp)
+
+test_glmm_envcov_tmp <- rbind(pres_gps_envcov_tmp, bg_mcp_glmm_envcov_tmp) %>% 
+  filter(type == "test")
+
+summary(test_glmm_envcov_tmp)
+
+train_glmm_envcov_tmp %>% 
+  st_drop_geometry() %>% 
+  group_by(point_case) %>% 
+  summarise(nrows = n())
+#   point_case nrows
+#        <dbl> <int>
+# 1          0 24722
+# 2          1  2591
+
+test_glmm_envcov_tmp %>% 
+  st_drop_geometry() %>% 
+  group_by(point_case) %>% 
+  summarise(nrows = n())
+#  point_case nrows
+#        <dbl> <int>
+# 1          0  6412
+# 2          1   649
+
+```
+
+prepare train and test data for glmm 
+
+```{r}
+# TRAIN DATA
+train_glmm_envcov_df <- train_glmm_envcov_tmp %>% 
+  mutate(x_3035 = st_coordinates(.)[,1], 
+         y_3035 = st_coordinates(.)[,2]) %>% 
+  as.data.frame() %>% 
+  mutate(weighting = ifelse(point_case == 1, 10, 1),
+         CLC2012 = as.factor(as.character(CLC2012))) %>% 
+  droplevels() %>% 
+  dplyr::select( -geom)
+  
+table(train_glmm_envcov_df$CLC2012)
+
+# No observations in clc 103, we remove the level 
+my_glmm_data <- train_glmm_envcov_df[train_glmm_envcov_df$CLC2012 != 103, ] %>% 
+  droplevels()
+
+my_glmm_data$CLC2012
+
+my_glmm_data <- na.omit(my_glmm_data)
+head(my_glmm_data)
+
+
+# TEST DATA
+# remove the extra Land use
+my_glmm_test_data <- test_glmm_envcov_tmp %>% 
+  mutate(x_3035 = st_coordinates(.)[,1], 
+         y_3035 = st_coordinates(.)[,2]) %>% 
+  as.data.frame() %>% 
+  mutate(weighting = ifelse(point_case == 1, 10, 1),
+         CLC2012 = as.factor(as.character(CLC2012))) %>% 
+  filter(CLC2012 != "103") %>% 
+  droplevels() %>% 
+  dplyr::select(-geom)
+
+my_glmm_test_data$CLC2012
+table(my_glmm_test_data$CLC2012)
+
+my_glmm_test_data <- na.omit(my_glmm_test_data)
+head(my_glmm_test_data)
+
+# write.csv(my_glmm_data, paste0(results_wd, "/glmm_results/glmm_train_data.csv"), row.names = FALSE)
+# write.csv(my_glmm_test_data, paste0(results_wd, "/glmm_results/glmm_test_data.csv"), row.names = FALSE)
+```
+
+Put toghether datasets and save to data folder without coordinates
+```{r}
+glmm_data_bf2018 <- rbind(my_glmm_data, my_glmm_test_data) %>% 
+  dplyr::select(-c(x_3035, y_3035))
+
+head(glmm_data_bf2018)
+
+write.csv(glmm_data_bf2018)
+```
+
+## Run glmm
+```{r}
+glmm_linear <- glmer(point_case  ~ 
+                   CLC2012 * 
+                    (scale(HFP) + 
+                       scale(Pop_den) + 
+                       scale(Dist_settl) + 
+                       scale(Dist_roads)) + 
+                    (1|id), 
+                  family = binomial(), 
+                  weights = weighting, 
+                  data = my_glmm_data, 
+                  verbose = FALSE, 
+                  nAGQ = 0, 
+                  control = glmerControl(optimizer = "nloptwrap"),
+                  na.action = na.fail
+                  )
+
+summary(glmm_linear)
+
+## see effects
+ggpredict(glmm_linear, terms = c("HFP [all]", "CLC2012")) %>%
+    plot() +
+    xlab("HFP") +
+    scale_colour_manual(values = viridis(7),
+                      name = "CLC",
+                      labels = c("urban", "agriculture", "forest",
+                                               "green no cover", "green with cover",
+                                               "soil no cover", "water bodies")) +
+    theme(panel.background = element_blank()) 
+
+ggpredict(glmm_linear, terms = c("Pop_den [all]", "CLC2012")) %>%
+    plot() +
+    xlab("Pop_den") +
+    scale_colour_manual(values = viridis(7),
+                      name = "CLC",
+                      labels = c("urban", "agriculture", "forest",
+                                               "green no cover", "green with cover",
+                                               "soil no cover", "water bodies")) +
+    theme(panel.background = element_blank()) 
+
+ggpredict(glmm_linear, terms = c("Dist_settl [all]", "CLC2012")) %>%
+    plot() +
+    xlab("Dist_settl") +
+    scale_colour_manual(values = viridis(7),
+                      name = "CLC",
+                      labels = c("urban", "agriculture", "forest",
+                                               "green no cover", "green with cover",
+                                               "soil no cover", "water bodies")) +
+    theme(panel.background = element_blank()) 
+
+ggpredict(glmm_linear, terms = c("Dist_roads [all]", "CLC2012")) %>%
+    plot() +
+    xlab("Dist_roads") +
+    scale_colour_manual(values = viridis(7),
+                      name = "CLC",
+                      labels = c("urban", "agriculture", "forest",
+                                               "green no cover", "green with cover",
+                                               "soil no cover", "water bodies")) +
+    theme(panel.background = element_blank()) 
+
+# model assumptions (DHARMa)
+simulationOutput <- simulateResiduals(fittedModel = glmm_linear, plot = T)
+
+testZeroInflation(simulationOutput)
+testDispersion(simulationOutput)
+residuals(simulationOutput)
+plot(simulationOutput)
+
+
+## rerun GLMM model
+
+# account for overdispersion 
+my_glmm_data$obs <- 1:nrow(my_glmm_data)
+glmm_linear2 <- glmer(point_case  ~ 
+                   CLC2012 * 
+                    (scale(HFP) + 
+                       scale(Pop_den) + 
+                       scale(Dist_settl) + 
+                       scale(Dist_roads)) + 
+                    (1|id), 
+                  family = binomial(), 
+                  # weights = weighting,
+                  data = my_glmm_data, 
+                  verbose = FALSE, 
+                  nAGQ = 0, 
+                  control = glmerControl(optimizer = "nloptwrap"),
+                  na.action = na.fail
+                  )
+simulationOutput2 <- simulateResiduals(fittedModel = glmm_linear2, plot = T)
+
+anova(glmm_linear, glmm_linear2)
+
+testDispersion(simulationOutput2)
+residuals(simulationOutput2)
+plot(simulationOutput2)
+
+
+# preudo r square
+# r.squaredGLMM(glmm_full)
+r.squaredGLMM(glmm_linear2)
+```
+
+## GLMM predict
+```{r}
+## load rasters
+env_germany <- stack(paste0(geoproc_wd, "/stack_env_rasters_germany_3035_AP.tif"))
+# add names to the stack
+names(env_germany) <- c("CLC2012", "Pop_den", "Dist_settl", "Dist_roads", "HFP") 
+
+
+f <- list(levels(my_glmm_data$CLC2012))
+names(f) <- "CLC2012"
+
+pred_glmm_linear <- raster::predict(object =  env_germany, 
+                                    model= glmm_linear2, 
+                                    re.form = ~ 0, 
+                                    type = c("response"),
+                                    factors = f)
+
+values(pred_glmm_linear)
+
+## plot predictions
+plot(pred_glmm_linear) 
+tm_glmm <- tm_shape(pred_glmm_linear) + 
+  tm_raster(alpha = 1,
+            n = 10, 
+            palette = viridis(100), 
+            legend.show = TRUE,
+            title = "GLMM predictions") +
+   tm_layout(title = paste0("GLMM"),
+              title.color = "black",
+              title.bg.color = "white",
+              title.position = c(0.001, 0.95), 
+              legend.position = c(0.75, 0.7),
+              legend.bg.color = NA,
+              frame = FALSE,
+              legend.show = TRUE,
+              inner.margins = c(0, 0, 0.05, 0.2),
+              outer.margins = c(0, 0, 0, 0)) +
+     tm_scale_bar(breaks = c(0, 100, 200), 
+                  text.size = 1, 
+                  position = c(0.68,0.05))
+```
+
+## Model evaluation
+
+```{r}
+# AUC test
+linear_eval2 <- dismo::evaluate(p = my_glmm_test_data[my_glmm_test_data$point_case == 1,], 
+                a = my_glmm_test_data[my_glmm_test_data$point_case == 0,], 
+                model = glmm_linear2)
+
+linear_eval <- dismo::evaluate(p = my_glmm_test_data[my_glmm_test_data$point_case == 1,], 
+                a = my_glmm_test_data[my_glmm_test_data$point_case == 0,], 
+                model = glmm_linear)
+
+linear_eval
+linear_eval@auc
+# [1] 0.7286928
+
+plot(linear_eval, 'ROC')
+plot(linear_eval, 'kappa')
+plot(linear_eval, 'FPR')
+plot(linear_eval, 'prevalence')
+boxplot(linear_eval)
+density(linear_eval)
+
+
+# TSS test 
+# Threshold for TSS: MaxSSS threshold
+
+# Predict test data
+sp_pred <- predict(glmm_linear2, my_glmm_test_data)
+sp_occ <- my_glmm_test_data$point_case
+
+TSS100_glmm_test <- ecospat.max.tss(Pred = sp_pred, Sp.occ = sp_occ) # tss along multiple thresholds
+TSS100_table <- TSS100_glmm_test$table
+TSS100_table[TSS100_table$threshold== TSS100_glmm_test$max.threshold,] # tss in MaxSSS threshold
+
+test_presences <- my_glmm_test_data %>% 
+  filter(point_case == 1) %>%  # only presences
+  st_as_sf(coords = c("x_3035", "y_3035"), crs = 3035) #make spatial
+
+test_presences_xy <- st_coordinates(test_presences)  
+
+
+presences_predict_values <- cbind.data.frame(sp_pred, sp_occ) %>% 
+  filter(sp_occ == 1)
+
+# get habitat suitability values (raster values) for test presences
+pred_values_test <- raster::extract(pred_glmm_linear, as_Spatial(test_presences), sp = TRUE)
+pred_values_test_vector <- pred_values_test$pred_glmm_linear_20210306
+# [1] 643
+
+# with spatial data
+test_sp <- ecospat.boyce(fit = pred_glmm_linear, obs = test_presences_xy, nclass = 0)
+test_sp$Spearman.cor
+# [1] 0.998
+
+```
+
+
+## GLMM validation - test set 2 - >=2018 data
+
+```{r load and prepare data}
+#load test2 data with env values
+obs_mcp_glmm_test2_af2018 <- st_read(paste0(dataproc_wd, "/envcov_pres_telemetry_af2018.gpkg"))
+obs_mcp_glmm_test2_af2018_df <- st_coordinates(obs_mcp_glmm_test2_af2018)
+unique(obs_mcp_glmm_test2_af2018$id)
+
+bg_mcp_glmm_test2_af2018 <- st_read(paste0(dataproc_wd,"/envcov_bg_mcp_glmm_af2018.gpkg"))
+bg_mcp_glmm_test2_af2018_df <- st_coordinates(bg_mcp_glmm_test2_af2018)
+
+obs_test2_mcp_glmm_envcov_tmp <- obs_mcp_glmm_test2_af2018 %>% 
+  mutate(point_case = 1) %>% 
+  dplyr::select(id, point_case, CLC2012, Pop_den, Dist_settl, Dist_roads, HFP) 
+
+bg_test2_mcp_glmm_envcov_tmp <- bg_mcp_glmm_test2_af2018 %>% 
+  mutate(point_case = 0) %>% 
+  dplyr::select(id, point_case, CLC2012, Pop_den, Dist_settl, Dist_roads, HFP) 
+
+test2_glmm_envcov_tmp <- rbind(obs_test2_mcp_glmm_envcov_tmp, bg_test2_mcp_glmm_envcov_tmp) 
+summary(test2_glmm_envcov_tmp)
+
+# remove the extra Land use
+# TEST DATA
+my_glmm_test2_data <- test2_glmm_envcov_tmp %>% 
+  mutate(x_3035 = st_coordinates(.)[,1], 
+         y_3035 = st_coordinates(.)[,2]) %>% 
+  as.data.frame() %>% 
+  mutate(weighting = ifelse(point_case == 1, 10, 1),
+         CLC2012 = as.factor(as.character(CLC2012))) %>% 
+  filter(CLC2012 != "103") %>% 
+  droplevels() %>% 
+  dplyr::select(-geom)
+
+my_glmm_test2_data <- na.omit(my_glmm_test2_data)
+head(my_glmm_test2_data)
+my_glmm_test2_data %>% 
+  group_by(point_case) %>% 
+  summarise(nrows = n())
+
+pres2 <- my_glmm_test2_data[my_glmm_test2_data$point_case == 1,]
+abs2 <- my_glmm_test2_data[my_glmm_test2_data$point_case == 0,]
+str(pres2)
+str(abs2)
+```
+
+
+```{r model validation}
+# AUC test
+linear_eval2 <- dismo::evaluate(p = my_glmm_test2_data[my_glmm_test2_data$point_case == 1,], 
+                a = my_glmm_test2_data[my_glmm_test2_data$point_case == 0,], 
+                model = glmm_linear2, allow.new.levels = TRUE) # this is necessary for the new random factors
+linear_eval2@auc
+
+linear_eval <- dismo::evaluate(p = my_glmm_test2_data[my_glmm_test2_data$point_case == 1,], 
+                a = my_glmm_test2_data[my_glmm_test2_data$point_case == 0,], 
+                model = glmm_linear, allow.new.levels = TRUE) # this is necessary for the new random factors
+
+linear_eval
+linear_eval@auc
+
+
+# TSS test 
+# Threshold for TSS: MaxSSS threshold
+
+# Predict test data
+sp_pred2 <- predict(glmm_linear2, my_glmm_test2_data, allow.new.levels = TRUE)
+sp_occ2 <- my_glmm_test2_data$point_case
+
+TSS100_glmm_test2 <- ecospat.max.tss(Pred = sp_pred2, Sp.occ = sp_occ2) # tss along multiple thresholds
+TSS100_test2_table <- TSS100_glmm_test2$table
+TSS100_test2_table[TSS100_test2_table$threshold== TSS100_glmm_test2$max.threshold,] # tss in MaxSSS threshold
+
+
+# continuous Boyce index (library: ecospat)
+## Requires the Habitat suitabilty predictions
+
+test2_presences <- my_glmm_test2_data %>% 
+  filter(point_case == 1) %>%  # only presences
+  st_as_sf(coords = c("x_3035", "y_3035"), crs = 3035) #make spatial
+
+test2_presences_xy <- st_coordinates(test2_presences)  
+
+presences2_predict_values <- cbind.data.frame(sp_pred2, sp_occ2) %>% 
+  filter(sp_occ2 == 1)
+
+# get habitat suitability values (raster values) for test presences
+pred_glmm_linear_values <- values(pred_glmm_linear) 
+pred_glmm_linear_values <- pred_glmm_linear_values[!is.na(pred_glmm_linear_values)]
+
+pred_values_test <- raster::extract(pred_glmm_linear, as_Spatial(test2_presences), sp = TRUE)
+pred_values_test_vector <- pred_values_test$pred_glmm_linear_20210306
+
+# with vector data
+test2_boyce_glmm <- ecospat.boyce(fit = pred_glmm_linear_values, obs = pred_values_test_vector, 
+                                  nclass = 0)
+test2_boyce_glmm$Spearman.cor
+```
+
+
+## GET GLMM individual random effects
+```{r}
+## Load model
+my_colors <- viridis(18)
+
+glmm_linear2@call
+
+pr <- ggpredict(glmm_linear2, terms = c("CLC2012", "id"), type = "re")
+
+# plot together
+(my_plot_1 <- plot(pr) +
+  scale_colour_manual(values = my_colors)) 
+
+ggsave(paste0(results_wd, "/glmm_results/plot_random_intercepts_CLC_facets.png"),
+       plot = my_plot_1)
+```
+
+
+## Run glmm for breeding status
+
+```{r}
+## Define breeding status of each individual
+unique(my_glmm_data$id)
+
+## assigned breeding status
+breed_status <- data.frame(
+  id = c("WF5", "WR4", "WF3", "WR1", "FT10", "WR6", "FT6", "FT5", "ID3", "ID1", "MT2", 
+         "IDp1", "FT4", "MT4", "FT3", "FT2", "MT3", "FT8", "FT7", "FT9", "MT5"), 
+  status = as.factor(c("subadult", "breeder", "subadult", "subadult", "subadult", 
+                       "breeder", "subadult", "subadult", "breeder", "subadult", 
+                       "breeder", "breeder", "subadult", "breeder", "breeder", 
+                       "subadult", "subadult", "breeder", "breeder", "breeder", "breeder"))
+  )
+breed_status
+
+my_glmm_data_breed <- left_join(my_glmm_data, breed_status, by ="id")
+summary(my_glmm_data_breed)
+str(my_glmm_data_breed)
+my_glmm_data_breed$id[is.na(my_glmm_data_breed$status)]
+
+# Run glmm with breeding status 
+
+glmm_status <- glmer(point_case  ~ status * CLC2012 +
+                       status * (scale(HFP) + 
+                       scale(Pop_den) + 
+                       scale(Dist_settl) + 
+                       scale(Dist_roads)) +
+                   CLC2012 * 
+                    (scale(HFP) + 
+                       scale(Pop_den) + 
+                       scale(Dist_settl) + 
+                       scale(Dist_roads)) + 
+                    (1|id), 
+                  family = binomial(), 
+                  weights = weighting, 
+                  data = my_glmm_data_breed, 
+                  verbose = FALSE, 
+                  nAGQ = 0, 
+                  control = glmerControl(optimizer = "nloptwrap"),
+                  na.action = na.fail
+                  )
+
+summary(glmm_status)
+```
+
+
+## Plot individual effects - breeding
+
+```{r}
+pr <- ggpredict(glmm_status, terms = c("CLC2012", "id"), type = "re")
+
+## Colors for IDs
+my_colors <- viridis(18)
+
+## Colors for status
+breed_status <- breed_status %>% 
+  mutate(col = case_when(
+    status == "subadult" ~ "green3",
+    status == "breeder" ~ "darkorange"
+  ))
+
+status_col <- breed_status$col
+
+###########
+table_pr <- cbind.data.frame(x = pr$x, predicted = pr$predicted, 
+                             std.error = pr$std.error, 
+                             conf.low = pr$conf.low, 
+                             conf.high = pr$conf.high, 
+                             group = pr$group)
+
+plot_2 <- table_pr %>% 
+  filter(x != 101) %>%  # removed due to excesive variance for the plot
+  filter(x != 108) %>%
+ggplot(aes(x = x, y = predicted, colour = group)) +
+  # geom_jitter() +
+  geom_point(position=position_dodge(width=0.5)) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), 
+                position=position_dodge(width=0.5)) +
+  scale_colour_manual(values = status_col,
+                      name = "ID") +
+  ylab("Predicted probability") +
+  xlab("CLC2012") +
+  ggtitle(NULL) +
+  coord_cartesian(xlim = c(1, 6), # This focuses the x-axis on the range of interest
+                      clip = 'off') + 
+  scale_colour_manual(values = status_col,
+                    name = "ID") +
+  theme(
+    panel.background = element_blank(), 
+    axis.text = element_text(colour  = "black", size = 12),
+    axis.title = element_text(colour  = "black", face = "bold", size = 14),
+    axis.line.y = element_line(colour  = "black", size = 0.5), 
+    axis.line.x = element_line(colour  = "black", size = 0.5), 
+    legend.position = c(0.875, 0.57), 
+    legend.key.height = unit(1,"line"),
+    legend.background = element_rect(fill = "white")
+  )+
+  # annotate("rect", xmin = 5.5, xmax = 6.3, 
+  #          ymin = -0.0, ymax = 0.13, 
+  #          fill = "white", 
+  #          colour = "black") +
+  
+  annotate("text", label = "breeder \nsubadult", x = 5.8, y = 0.025, hjust = 0, 
+           vjust = 0) +
+  
+  annotate("text", label = "Breeding Status", x = 5.62, y = 0.12, hjust = 0, 
+           vjust = 0) +
+  annotate("point", colour = "darkorange", 
+           x = 5.65, y = 0.035, size = 3) +
+  annotate("point", colour = "green3", 
+           x = 5.65, y = 0.08, size = 3)
+plot_2
+
+
+ggsave(plot = plot_2, 
+       filename = paste0(results_wd, "/glmm_results/plot_random_intercepts_CLC_breeding_2.png"), 
+       dpi = 600)
+```
+
+
+
+
+
+#---------------------------------
+# MAXENT Telemetry model
+
+we use data **before 2018**
+- presences: telemetry data filtered by day and grid
+- background: random points (10x presences) selected in bias raster with 
+  prob 0.99 in 100% MCPs and 0.01 outside, filtered by grid
+- environmental variables extracted at the point location
+- Data divide into train (80%) and test (20%) sets
+
+
+```{r prepare workspace}
+rm(list = ls())
+
+source("./Rscripts/source_file_packages.R")
+source("./Rscripts/source_file_functions.R")
+
+workDir <- getwd()
+dataproc_wd <- paste0(workDir, "/output/data_proc")
+geoproc_wd <- paste0(workDir, "/output/geo_proc")
+results_wd <- paste0(workDir, "/output/results")
+```
+
+```{r Load data}
+# environmental rasters
+env_germany <- stack(paste0(geoproc_wd, "/stack_env_rasters_germany_3035_AP.tif"))
+names(env_germany) <- c("CLC2012", "Pop_den", "HFP", "Dist_settl", "Dist_roads") 
+
+# Load observations with env data
+pres_gps_envcov_sf <- st_read(paste0(dataproc_wd, "/envcov_pres_telemetry.gpkg")) %>% 
+  st_transform(crs = 3035)  
+  
+# Load background with env data
+bg_mcp_maxent_envcov_sf <- st_read(paste0(dataproc_wd, "/envcov_bg_mcp_maxent.gpkg")) %>% 
+  st_transform(crs = 3035)
+
+# put both dataset together and select train and test data
+pres_gps_envcov <- pres_gps_envcov_sf %>% 
+  mutate(point_case = 1) %>% 
+  dplyr::select(point_case, type, CLC2012, Pop_den, Dist_settl, Dist_roads, HFP) 
+
+bg_mcp_maxent_envcov <- bg_mcp_maxent_envcov_sf %>%
+  mutate(point_case = 0) %>% 
+  dplyr::select(point_case, type, CLC2012, Pop_den, Dist_settl, Dist_roads, HFP) 
+
+all_mcp_maxent_envcov_sf <- rbind(pres_gps_envcov, bg_mcp_maxent_envcov) 
+summary(all_mcp_maxent_envcov_sf)
+```
+
+Run mcp maxent model
+```{r}
+obs_mcp_train_df <- all_mcp_maxent_envcov_sf %>% 
+  filter(type == "train") %>%
+  filter(point_case == 1) %>% 
+  st_coordinates()
+
+bg_mcp_train_df <- all_mcp_maxent_envcov_sf %>% 
+  filter(type == "train") %>% 
+  filter(point_case == 0) %>% 
+  st_coordinates()
+  
+nrow(obs_mcp_train_df) # 2591
+nrow(bg_mcp_train_df) # 25920
+
+maxent_mcp <- maxent(env_germany, 
+                  obs_mcp_train_df,
+                  a = bg_mcp_train_df, 
+                  factors = c('CLC2012'),
+                  path = paste0(results_wd, "/maxent_mcp_results"),
+                  args = c("replicates=10", "outputformat=logistic", "writebackgroundpredictions"))
+
+# saveRDS(maxent_mcp, paste0(results_wd, "/maxent_mcp_results/maxent_mcp_model.rds"))
+```
+
+### predict mcp maxent
+```{r}
+pred_maxent_mcp <- dismo::predict(maxent_mcp, env_germany, progress='text')
+
+mean_pred_maxent_mcp <- mean(pred_maxent_mcp)
+
+pred_maxent_mcp_mask <- mean_pred_maxent_mcp %>%
+ mask(as(germany_3035, "Spatial"))
+
+plot(pred_maxent_mcp_mask)
+```
+
+
+## Evaluate maxent mcp
+```{r}
+## AUC value
+# evaluate model
+obs_mcp_test_df <- all_mcp_maxent_envcov_sf %>% 
+  filter(type == "test") %>%
+  filter(point_case == 1) %>% 
+  st_coordinates()
+
+bg_mcp_test_df <- all_mcp_maxent_envcov_sf %>% 
+  filter(type == "test") %>% 
+  filter(point_case == 0) %>% 
+  st_coordinates()
+
+# as we run replicates, we need to evaluate all the models in the list
+eval_list <- lapply(1:length(maxent_mcp@models), function(e){
+eval_xm <- dismo::evaluate(p = obs_mcp_test_df, a = bg_mcp_test_df, model = maxent_mcp@models[[e]], x = env_germany); 
+return(eval_xm)})
+
+## get mean auc 
+auc_list <- vector()
+for (i in 1:length(eval_list)){
+  auc_list[i] <- eval_list[[i]]@auc
+}
+mean(auc_list)
+
+plot(eval_list[[1]],"ROC")
+
+
+e <- eval_list[[1]]
+threshold(e)
+plot(e, 'ROC')
+boxplot(e)
+
+## get TSS value 
+# TSS value (own function, source file)
+maxent_mcp_tss <- get_maxent_tss(model_directory = paste0(results_wd, "/maxent_mcp_results"), 
+                                 data.type = "test", n.replicates = 10)
+maxent_mcp_tss
+mean(maxent_mcp_tss$tss) 
+
+
+## continuous Boyce index (library: ecospat)
+# Requires the Habitat suitabilty predictions (below)
+my_pred_raster <- list.files(paste0(results_wd ,"/maxent_mcp_results/"), 
+                             pattern = c("pred_mean.+tif")) # filters for both patterns
+pred_mean_maxent_mcp <- raster(paste0(results_wd ,"/maxent_mcp_results/", my_pred_raster))
+
+obs_mcp_test_df
+
+# with spatial data
+boyce_maxent_mcp <- ecospat.boyce(fit = pred_mean_maxent_mcp, obs = obs_mcp_test_df, nclass = 0)
+boyce_maxent_mcp$Spearman.cor
+```
+
+
+## Evaluate maxent mcp - test set 2, >= 2018
+```{r}
+## Load test 2 data
+obs_mcp_test2_af2018 <- st_read(paste0(dataproc_wd, "/gps_points_eval_af2018_3035.gpkg"))
+obs_mcp_test2_af2018_df <- st_coordinates(obs_mcp_test2_af2018)
+nrow(obs_mcp_test2_af2018_df) # 601
+
+bg_mcp_test2_af2018 <- st_read(paste0(dataproc_wd,"/bg_test2_af2018_maxent_mcp_3035_AP.gpkg"))
+bg_mcp_test2_af2018_df <- st_coordinates(bg_mcp_test2_af2018)
+nrow(bg_mcp_test2_af2018_df) # 6010
+
+## AUC value
+# evaluate model
+# as we run replicates, we need to evaluate all the models in the list
+eval_list_test2 <- lapply(1:length(maxent_mcp@models), function(e){
+eval_xm <- dismo::evaluate(p = obs_mcp_test2_af2018_df, a = bg_mcp_test2_af2018_df, 
+                           model = maxent_mcp@models[[e]], x = env_germany); 
+return(eval_xm)})
+
+# get mean auc 
+auc_list_test2 <- vector()
+for (i in 1:length(eval_list_test2)){
+  auc_list_test2[i] <- eval_list_test2[[i]]@auc
+}
+mean(auc_list_test2)
+
+plot(eval_list_test2[[1]],"ROC")
+
+
+e <- eval_list_test2[[1]]
+threshold(e)
+plot(e, 'ROC')
+boxplot(e)
+
+## tss function
+# TSS value (we get predictions for samples nad background 
+# manually from prediction raster and coordinates)
+
+# Requires the Habitat suitabilty predictions 
+# get habitat values for test2 presences
+samples_tmp <- raster::extract(pred_mean_maxent_mcp, as_Spatial(obs_mcp_test2_af2018), sp = TRUE)
+
+# get habitat values for test2 backgrounds
+background_tmp <- raster::extract(pred_mean_maxent_mcp, as_Spatial(bg_mcp_test2_af2018), sp = TRUE)
+
+samples <- samples_tmp %>% 
+  as.data.frame() %>% 
+  dplyr::select(id, predict = grep(colnames(.), pattern= "pred_mean"), coords.x1, coords.x2)
+  
+background <- background_tmp %>% 
+  as.data.frame() %>% 
+  dplyr::select(predict = grep(colnames(.), pattern= "pred_mean"), coords.x1, coords.x2)
+
+# get threshold: maxSSS averaged model
+# Load thresholds
+thresh_tmp <- read.csv(paste0(results_wd,"/maxent_mcp_results/maxentResults.csv"), header=TRUE)
+#Select maximum logistic threshold values for test data 
+threshold <- thresh_tmp[11,c(grep("Maximum.test.+logistic.threshold",names(thresh_tmp)))]
+  
+# get TSS
+test2_mcp_maxent_tss <- calc_tss(samples, background, threshold)  
+test2_mcp_maxent_tss
+
+
+## continuous Boyce index (library: ecospat)
+# Requires the Habitat suitabilty predictions 
+boyce_test2_maxent_mcp <- ecospat.boyce(fit = pred_mean_maxent_mcp, obs = obs_mcp_test2_af2018_df, nclass = 0)
+boyce_test2_maxent_mcp$Spearman.cor
+# [1] 0.99
+cor(boyce_test2_maxent_mcp$F.ratio, boyce_test2_maxent_mcp$HS, method = "spearman")
+# [1] 0.989883
+```
+
+
+
+#----------------------------------------------------
+# MAXENT Combined model
+
+we use data **before 2018**
+- presences: gps telemetry filtered by day and grid
+- background: random points (10x presences) selected in bias raster with 
+  prob 0.99 in 10km territory buffers and 0.01 outside, filtered by grid
+- Data divide into train (80%) and test (20%) sets
+
+```{r prepare workspace}
+rm(list = ls())
+
+source("./Rscripts/source_file_packages.R")
+source("./Rscripts/source_file_functions.R")
+
+workDir <- getwd()
+dataproc_wd <- paste0(workDir, "/output/data_proc")
+geoproc_wd <- paste0(workDir, "/output/geo_proc")
+results_wd <- paste0(workDir, "/output/results")
+```
+
+Load data
+```{r}
+# environmental rasters
+env_germany <- stack(paste0(geoproc_wd, "/stack_env_rasters_germany_3035_AP.tif"))
+names(env_germany) <- c("CLC2012", "Pop_den", "HFP", "Dist_settl", "Dist_roads") 
+
+# Load observations with env data
+pres_gps_envcov_sf <- st_read(paste0(dataproc_wd, "/envcov_pres_telemetry.gpkg")) %>% 
+  st_transform(crs = 3035)  
+
+# Select presences train and test data
+pres_gps_train <- pres_gps_envcov_sf %>% 
+  filter(type == "train") %>% 
+  st_coordinates()
+
+pres_gps_test <- pres_gps_envcov_sf %>% 
+  filter(type == "test") %>% 
+  st_coordinates()
+
+nrow(pres_gps_train) # [1] 2591
+nrow(pres_gps_test) # [1] 649
+
+
+# Load background
+bg_train_maxent_comb_grid <- st_read(paste0(dataproc_wd,"/bg_train_bf2018_maxent_comb_3035_AP.gpkg"))
+bg_test_maxent_comb_grid <- st_read(paste0(dataproc_wd,"/bg_test_bf2018_maxent_comb_3035_AP.gpkg"))
+
+bg_comb_train <- bg_train_maxent_comb_grid %>% 
+  st_coordinates()
+
+bg_comb_test <- bg_test_maxent_comb_grid %>% 
+  st_coordinates()
+
+nrow(bg_comb_train) 
+nrow(bg_comb_test) 
+```
+
+Run combined maxent model
+```{r}
+maxent_comb <- maxent(env_germany, 
+                  pres_gps_train,
+                  a = bg_comb_train, 
+                  factors = c('CLC2012'),
+                  path = paste0(results_wd, "/maxent_combined_results"),
+                  args = c("replicates=10", "outputformat=logistic", "writebackgroundpredictions"))
+
+# saveRDS(maxent_comb, paste0(results_wd, "/maxent_combined_results/maxent_combined_model.rds"))
+```
+
+#### predict combined maxent
+```{r}
+pred_maxent_comb <- dismo::predict(maxent_comb, env_germany, progress='text')
+
+mean_pred_maxent_comb <- mean(pred_maxent_comb)
+
+pred_maxent_comb_mask <- mean_pred_maxent_comb %>%
+ mask(as(germany_3035, "Spatial"))
+
+plot(pred_maxent_comb_mask)
+```
+
+## Evaluate maxent combined
+
+```{r}
+## AUC value
+# as we run replicates, we need to evaluate all the models in the list
+eval_list <- lapply(1:length(maxent_comb@models), function(e){
+eval_xm <- dismo::evaluate(p = pres_gps_test, a = bg_comb_test, model = maxent_comb@models[[e]], x = env_germany); 
+return(eval_xm)})
+
+# get mean auc 
+auc_list <- vector()
+for (i in 1:length(eval_list)){
+  auc_list[i] <- eval_list[[i]]@auc
+}
+
+mean(auc_list)
+
+plot(eval_list[[1]],"ROC")
+
+e <- eval_list[[1]]
+threshold(e)
+plot(e, 'ROC')
+boxplot(e)
+
+## TSS value (own function, source file)
+maxent_comb_tss <- get_maxent_tss(model_directory = paste0(results_wd, "/maxent_combined_results"), 
+                                 data.type = "test", n.replicates = 10)
+maxent_comb_tss
+mean(maxent_comb_tss$tss)
+# [1] 
+
+## continuous Boyce index (library: ecospat)
+# Requires the Habitat suitabilty predictions 
+my_pred_raster <- list.files(paste0(results_wd ,"/maxent_combined_results/"), 
+                             pattern = c("pred_mean.+tif")) # filters for both patterns
+pred_mean_maxent_comb <- raster(paste0(results_wd ,"/maxent_combined_results/", my_pred_raster))
+
+pres_gps_test
+
+# with spatial data
+boyce_maxent_comb <- ecospat.boyce(fit = pred_mean_maxent_comb, obs = pres_gps_test, nclass = 0) # NA in obs might give errors
+boyce_maxent_comb$Spearman.cor
+```
+
+## Evaluate maxent combined - test2, >= 2018
+```{r}
+## Load test 2 data
+pres_test2_af2018_comb_maxent <- st_read(paste0(dataproc_wd,"/gps_points_eval_af2018_3035.gpkg"))
+obs_comb_test2_af2018_df <- st_coordinates(pres_test2_af2018_comb_maxent)
+nrow(obs_comb_test2_af2018_df) #[1] 601
+
+bg_test2_maxent_comb <- st_read(paste0(dataproc_wd,"/bg_test2_af2018_maxent_comb_3035_AP.gpkg")) %>% 
+   st_transform(crs = 3035) 
+bg_comb_test2_af2018_df <- st_coordinates(bg_test2_maxent_comb)
+nrow(bg_comb_test2_af2018_df) # 6009
+
+## AUC value
+# evaluate model
+# as we run replicates, we need to evaluate all the models in the list
+eval_list_comb_test2 <- lapply(1:length(maxent_comb@models), function(e){
+eval_xm <- dismo::evaluate(p = obs_comb_test2_af2018_df, a = bg_comb_test2_af2018_df, 
+                           model = maxent_comb@models[[e]], x = env_germany); 
+return(eval_xm)})
+
+# get mean auc 
+auc_list_comb_test2 <- vector()
+for (i in 1:length(eval_list_comb_test2)){
+  auc_list_comb_test2[i] <- eval_list_comb_test2[[i]]@auc
+}
+mean(auc_list_comb_test2)
+
+plot(eval_list_comb_test2[[1]],"ROC")
+
+
+## tss function
+samples_comb2_tmp <- raster::extract(pred_mean_maxent_comb, as_Spatial(pres_test2_af2018_comb_maxent), sp = TRUE)
+
+# get habitat values for test2 backgrounds
+background_comb2_tmp <- raster::extract(pred_mean_maxent_comb, as_Spatial(bg_test2_maxent_comb), sp = TRUE)
+
+samples <- samples_comb2_tmp %>% 
+  as.data.frame() %>% 
+  dplyr::select(predict = grep(colnames(.), pattern= "pred_mean"), coords.x1, coords.x2)
+  
+background <- background_comb2_tmp %>% 
+  as.data.frame() %>% 
+  dplyr::select(predict = grep(colnames(.), pattern= "pred_mean"), coords.x1, coords.x2)
+
+# get threshold: maxSSS averaged model
+# Load thresholds
+thresh_tmp <- read.csv(paste0(results_wd,"/maxent_combined_results/maxentResults.csv"), header=TRUE)
+#Select maximum logistic threshold values for test data 
+threshold <- thresh_tmp[11,c(grep("Maximum.test.+logistic.threshold",names(thresh_tmp)))]
+  
+# get TSS
+test2_comb_maxent_tss <- calc_tss(samples, background, threshold)  
+test2_comb_maxent_tss
+
+
+## continuous Boyce index (library: ecospat)
+# Requires the Habitat suitabilty predictions 
+
+# with spatial data
+boyce_test2_maxent_comb <- ecospat.boyce(fit = pred_mean_maxent_comb, obs = obs_comb_test2_af2018_df, nclass = 0)
+boyce_test2_maxent_comb$Spearman.cor
+```
+
+
+#---------------------------------
+# Ensemble models for the different data sources
+
+
+# ENSEMBLE Telemetry
+
+we use data **before 2018**
+- presences: telemetry data filtered by day and grid
+- background: random points (10x presences) selected in bias raster with 
+  prob 0.99 in 100% MCPs and 0.01 outside, filtered by grid
+- environmental variables extracted at the point location
+- Data divide into train (80%) and test (20%) sets
+
+We use the *background maxent* data as they represent the background points for germany 
+in relation to the observed telemetry points and have been already filtered to keep only
+one observation per grid
+
+
+```{r workspace}
+rm(list = ls())
+
+source("./Rscripts/source_file_functions.R")
+
+library(terra)
+library(biomod2)
+library(dplyr)
+library(sf)
+library(ecospat)
+
+workDir <- getwd()
+dataproc_wd <- paste0(workDir, "/output/data_proc")
+geoproc_wd <- paste0(workDir, "/output/geo_proc")
+results_wd <- paste0(workDir, "/output/results")
+```
+
+### Prepare data
+
+```{r load raster data}
+## spatial data
+# environmental rasters
+env_germany <- rast(paste0(geoproc_wd, "/stack_env_rasters_germany_3035_AP.tif"))
+names(env_germany) <- c("CLC2012", "Pop_den", "HFP", "Dist_settl", "Dist_roads") 
+
+env_germany_fct <- env_germany
+env_germany_fct$CLC2012 <- as.factor(env_germany_fct$CLC2012)
+```
+
+```{r load species data}
+# Load observations with env data
+pres_gps_envcov_sf <- st_read(paste0(dataproc_wd, "/envcov_pres_telemetry.gpkg")) %>% 
+  st_transform(crs = 3035)  
+  
+# Load background with env data
+bg_mcp_maxent_envcov_sf <- st_read(paste0(dataproc_wd, "/envcov_bg_mcp_maxent.gpkg")) %>% 
+  st_transform(crs = 3035)
+
+
+# put both dataset together and select train and test data
+pres_gps_envcov <- pres_gps_envcov_sf %>% 
+  mutate(point_case = 1) %>% 
+  dplyr::select(point_case, type, CLC2012, Pop_den, Dist_settl, Dist_roads, HFP) 
+
+bg_mcp_maxent_envcov <- bg_mcp_maxent_envcov_sf %>%
+  mutate(point_case = 0) %>% 
+  dplyr::select(point_case, type, CLC2012, Pop_den, Dist_settl, Dist_roads, HFP) 
+
+all_mcp_maxent_envcov_sf <- rbind(pres_gps_envcov, bg_mcp_maxent_envcov) 
+head(all_mcp_maxent_envcov_sf)
+```
+
+```{r get points}
+## get train point data
+train_mcp <- all_mcp_maxent_envcov_sf %>% 
+  filter(type == "train") %>%
+  mutate(pres_bg = point_case) %>% 
+  dplyr::select(pres_bg) %>% 
+  as_Spatial()
+
+nrow(train_mcp)
+
+## get test point data
+test_mcp <- all_mcp_maxent_envcov_sf %>% 
+  filter(type == "test") %>%
+  mutate(pres_bg = point_case) %>% 
+  dplyr::select(pres_bg) %>% 
+  as_Spatial()
+
+nrow(test_mcp)
+```
+
+```{r get env covariates}
+## Extract environmental covariates
+head(all_mcp_maxent_envcov_sf)
+
+## train covariates
+train_mcp_covariates <- all_mcp_maxent_envcov_sf %>%
+  filter(type == "train") %>%
+  as.data.frame() %>% 
+  dplyr::select(CLC2012:HFP) %>% 
+  mutate(CLC2012 = as.factor(as.character(CLC2012)))
+head(train_mcp_covariates)
+
+## test covariates
+test_mcp_covariates <- all_mcp_maxent_envcov_sf %>%
+  filter(type == "test") %>%
+  as.data.frame() %>% 
+  dplyr::select(CLC2012:HFP) %>% 
+  mutate(CLC2012 = as.factor(as.character(CLC2012)))
+head(test_mcp_covariates)
+```
+
+### prepare biomod object
+```{r biomod object}
+## Parameterize model options
+# For maxent, we need to add some options to the models. 
+# Important, the directory where to find java/maxent. 
+myBiomodOptions <- BIOMOD_ModelingOptions(
+  MAXENT = list( maximumiterations = 5000,
+                 responsecurves=TRUE,
+                 jacknife=TRUE,
+                 visible = FALSE,
+                 directory="/output/results_models/",
+                 linear = TRUE, 
+                 quadratic = TRUE,
+                 product = TRUE,
+                 threshold = FALSE,
+                 hinge = TRUE,
+                 lq2lqptthreshold = 80,
+                 l2lqthreshold = 10,
+                 hingethreshold = 15,
+                 beta_threshold = -1,
+                 beta_categorical = -1,
+                 beta_lqp = -1,
+                 beta_hinge = -1,
+                 defaultprevalence = 0.5),
+  GLM = list(family = "binomial"),
+  GAM = list( k = 5))
+
+
+## preapre data
+ensemble_mcp_dat <- BIOMOD_FormatingData(resp.var = train_mcp,
+                                     expl.var = train_mcp_covariates,
+                                     resp.name = "wolf_mcp_telemetry")
+```
+
+### run biomod models
+```{r run biomod}
+## models to run
+mcp_mod_out <- BIOMOD_Modeling(bm.format = ensemble_mcp_dat,
+                               bm.options = myBiomodOptions,
+                               models =c('GLM','GAM','GBM', 'MARS', 'ANN','RF','MAXENT'),
+                               modeling.id = 'AllModels', 
+                               nb.rep = 10,
+                               data.split.perc = 80,
+                               var.import = 10, 
+                               metric.eval = c("KAPPA", "TSS", "ROC"))
+
+# saveRDS(mcp_mod_out, paste0(results_wd, "/ensemble_mcp_results/ensemble_mcp_models.rds"))
+
+## check output
+mcp_mod_out
+str(mcp_mod_out)
+mcp_mod_out@models.computed
+```
+
+```{r get evaluation metrics for the individual models - NO NEED}
+# get all models evaluation
+wolf_ModelEval <- get_evaluations(mcp_mod_out)
+## values for the evaluation metrics on the training data (with cross validation)
+eval_table <- wolf_ModelEval %>% 
+  filter(metric.eval %in% c("TSS", "ROC")) %>% 
+  arrange(metric.eval) %>%
+  filter(run != "allRun") %>%
+  group_by(algo, metric.eval) %>% 
+  summarise(calibration = mean(calibration))
+
+# write.csv(eval_table, paste0(results_wd, "/ensemble_mcp_results/mcp_traindata_evalTable.csv"), row.names = FALSE)
+
+# print variable importance
+wolf_VarImpor <- get_variables_importance(mcp_mod_out)
+wolf_VarImpor
+# Variable importance of models
+## Average variable importance in the 10 model replicates
+VarImpor_table <- wolf_VarImpor %>% 
+  filter(run != "allRun") %>%
+  group_by(algo, expl.var) %>% 
+  summarise(var_imp_mean = mean(var.imp))
+VarImpor_table
+
+# write.csv(VarImpor_table, paste0(results_wd,
+#                                  "/ensemble_mcp_results/mcp_VariableImportance_mean.csv"), row.names = FALSE)
+
+```
+
+
+### Create ensemble model
+```{r}
+### Building ensemble-models
+# All models with AUC > 0.7
+mcp_ensemblemod <- BIOMOD_EnsembleModeling(bm.mod = mcp_mod_out,
+                                      models.chosen = 'all',
+                                      em.by = 'all',
+                                      em.algo = c('EMwmean'),
+                                      metric.select = c('ROC'),
+                                      metric.select.thresh = c(0.7),
+                                      metric.eval = c('TSS', 'ROC'),
+                                      var.import = 10,
+                                      EMci.alpha = 0.05,
+                                      EMwmean.decay = 'proportional')
+mcp_ensemblemod
+# saveRDS(mcp_ensemblemod, paste0(results_wd, "/ensemble_mcp_results/mcp_ensemble_mod.rds"))
+```
+
+### ensemble model evalutaions - TRAIN DATA
+```{r mcp eval1}
+# get evaluation scores for TSS and AUC
+ensemble_eval <- get_evaluations(mcp_ensemblemod)
+ensemble_eval %>% 
+  dplyr::select(algo, metric.eval, calibration)
+```
+
+```{r mcp eval1}
+# get boyce index
+myBiomodPO <- BIOMOD_PresenceOnly(bm.mod = mcp_mod_out,
+                                  bm.em = mcp_ensemblemod)
+myBiomodPO %>% 
+  filter(metric.eval %in% c("BOYCE")) %>% 
+  filter(run == "allRun") %>% 
+  group_by(metric.eval) %>% 
+  summarise(calibration_mean = mean(calibration), 
+            validation_mean = mean(validation))
+        
+```
+
+### Project ensemble model
+```{r project mcp ensemble}
+str(mcp_ensemblemod)
+
+env_germany <- rast(paste0(geoproc_wd, "/stack_env_rasters_germany_3035_AP.tif"))
+names(env_germany) <- c("CLC2012", "Pop_den", "HFP", "Dist_settl", "Dist_roads") 
+
+env_germany_fct <- env_germany
+env_germany_fct$CLC2012 <- as.factor(env_germany_fct$CLC2012)
+
+# Project ensemble models (building single projections)
+mcp_BiomodEMProj <- BIOMOD_EnsembleForecasting(bm.em = mcp_ensemblemod,
+                                             proj.name = 'mcp_ensemble',
+                                             new.env = env_germany_fct)
+
+mcp_BiomodEMProj
+plot(mcp_BiomodEMProj)
+saveRDS(mcp_BiomodEMProj, paste0(results_wd, "/ensemble_mcp_results/mcp_ensemble_proj.rds"))
+```
+
+
+## Evaluate ensemble telemetry - TEST DATA 1
+```{r get raster}
+mcp_projEnsemble <- get_predictions(mcp_BiomodEMProj)
+names(mcp_projEnsemble)
+
+mcp_EnsembleResult <- mcp_projEnsemble$wolf.mcp.telemetry_EMwmeanByROC_mergedData_mergedRun_mergedAlgo # weighted mean model based on AUC
+
+plot(mcp_EnsembleResult)
+
+# writeRaster(mcp_EnsembleResult,
+#             filename = paste0(results_wd, "/ensemble_mcp_results/mcp_ensemble_weightedmean_projection_3035.tif"),
+#             overwrite = T)
+```
+
+
+```{r get boyce test}
+## get observed data
+obs_mcp_test_df <- all_mcp_maxent_envcov_sf %>% 
+  filter(type == "test") %>%
+  filter(point_case == 1) %>% 
+  st_coordinates()
+
+## get raster file
+mcp_EnsembleResult_raster <- as.raster(mcp_EnsembleResult)
+plot(mcp_EnsembleResult_raster)
+
+## use own modified function to avoid error due to NA values and be able to use terra object
+# with spatial data
+boyce_ensemble_mcp_test1 <- ecospat.boyce.2(fit = mcp_EnsembleResult, 
+                                          obs = obs_mcp_test_df, nclass = 0, method = 'spearman')
+boyce_ensemble_mcp_test1$cor
+# [1] 1
+
+ # saveRDS(boyce_ensemble_mcp_test1, paste0(results_wd ,"/ensemble_mcp_results/boyce_ensemble_mcp_test1.rds"))
+```
+
+
+## Evaluate ensemble telemetry - TEST DATA 2 
+
+data >= 2018
+
+```{r}
+# Load ensemble model and projection
+mcp_ensemblemod <- readRDS(paste0(results_wd, "/ensemble_mcp_results/mcp_ensemble_mod.rds"))
+
+get_evaluations(mcp_ensemblemod)
+
+evaluate(mcp_ensemblemod, test_mcp_covariates)
+
+
+
+
+
+
+head(DataSpecies)
+
+# the name of studied species
+myRespName <- 'GuloGulo'
+
+# the presence/absences data for our species 
+myResp <- as.numeric(DataSpecies[,myRespName])
+
+# the XY coordinates of species data
+myRespXY <- DataSpecies[,c("X_WGS84","Y_WGS84")]
+
+
+# Environmental variables extracted from BIOCLIM (bio_3, bio_4, bio_7, bio_11 & bio_12)
+myExpl = raster::stack( system.file( "external/bioclim/current/bio3.grd", 
+                     package="biomod2"),
+                system.file( "external/bioclim/current/bio4.grd", 
+                             package="biomod2"), 
+                system.file( "external/bioclim/current/bio7.grd", 
+                             package="biomod2"),  
+                system.file( "external/bioclim/current/bio11.grd", 
+                             package="biomod2"), 
+                system.file( "external/bioclim/current/bio12.grd", 
+                             package="biomod2"))
+
+# 1. Formatting Data
+myBiomodData <- BIOMOD_FormatingData(resp.var = myResp,
+                                     expl.var = myExpl,
+                                     resp.xy = myRespXY,
+                                     resp.name = myRespName)
+
+# 2. Defining Models Options using default options.
+myBiomodOption <- BIOMOD_ModelingOptions()
+
+# 3. Doing Modelisation
+
+myBiomodModelOut <- BIOMOD_Modeling( myBiomodData, 
+                                     models = c('SRE','CTA','RF'), 
+                                     models.options = myBiomodOption, 
+                                     NbRunEval=1, 
+                                     DataSplit=80, 
+                                     Yweights=NULL, 
+                                     VarImport=3, 
+                                     models.eval.meth = c('TSS'),
+                                     SaveObj = TRUE,
+                                     rescal.all.models = FALSE,
+                                     do.full.models = FALSE,
+                                     modeling.id='test')
+
+## creation of suitable dataset
+data <- cbind(GuloGulo=get_formal_data(mcp_ensemblemod,'resp.var'), 
+              get_formal_data(mcp_ensemblemod,'expl.var'))
+
+
+
+## evaluation
+biomod2::evaluate(myBiomodModelOut, data=data, stat=c('ROC','TSS'))
+
+
+
+
+
+
+
+
+
+
+
+
+
+## Load test 2 data
+obs_mcp_test2_af2018 <- st_read(paste0(dataproc_wd, "/gps_points_eval_af2018_3035.gpkg"))
+obs_mcp_test2_af2018_df <- st_coordinates(obs_mcp_test2_af2018)
+nrow(obs_mcp_test2_af2018_df) # 601
+
+bg_mcp_test2_af2018 <- st_read(paste0(dataproc_wd,"/bg_test2_af2018_maxent_mcp_3035_AP.gpkg"))
+bg_mcp_test2_af2018_df <- st_coordinates(bg_mcp_test2_af2018)
+nrow(bg_mcp_test2_af2018_df) # 6010
+
+# Load envir data
+env_germany <- stack(paste0(geoproc_wd, "/stack_env_rasters_germany_3035_AP.tif"))
+names(env_germany) <- c("CLC2012", "Pop_den", "HFP", "Dist_settl", "Dist_roads") 
+
+# Load predictions
+mcp_EnsembleResult <- rast(paste0(results_wd, "/ensemble_mcp_results/mcp_ensemble_weightedmean_projection_3035.tif"))
+
+
+
+
+
+get_evaluations(mcp_BiomodEMProj)
+
+
+
+
+
+
+
+## AUC value
+# evaluate model
+# as we run replicates, we need to evaluate all the models in the list
+eval_list_test2 <- lapply(1:length(maxent_mcp@models), function(e){
+eval_xm <- dismo::evaluate(p = obs_mcp_test2_af2018_df, a = bg_mcp_test2_af2018_df, 
+                           model = maxent_mcp@models[[e]], x = env_germany); 
+return(eval_xm)})
+
+# get mean auc 
+auc_list_test2 <- vector()
+for (i in 1:length(eval_list_test2)){
+  auc_list_test2[i] <- eval_list_test2[[i]]@auc
+}
+
+mean(auc_list_test2)
+# [1] 0.655958
+
+plot(eval_list_test2[[1]],"ROC")
+
+# saveRDS(eval_list_test2, paste0(results_wd, "/maxent_mcp_results/maxent_mcp_model_eval_list_af2018.rds"))
+
+e <- eval_list_test2[[1]]
+threshold(e)
+plot(e, 'ROC')
+#plot(e, 'kappa')
+#plot(e, 'FPR')
+#plot(e, 'prevalence')
+boxplot(e)
+#density(e)
+
+## tss function
+
+## TSS value (we get predictions for samples nad background 
+# manually from prediction raster and coordinates)
+
+# Requires the Habitat suitabilty predictions (below)
+my_pred_raster <- list.files(paste0(results_wd ,"/maxent_mcp_results/"), 
+                             pattern = c("pred_mean.+tif")) # filters for both patterns
+pred_mean_maxent_mcp <- rast(paste0(results_wd ,"/maxent_mcp_results/", my_pred_raster))
+
+# get habitat values for test2 presences
+samples_tmp <- terra::extract(pred_mean_maxent_mcp, obs_mcp_test2_af2018, sp = TRUE)
+
+# get habitat values for test2 backgrounds
+background_tmp <- terra::extract(pred_mean_maxent_mcp, bg_mcp_test2_af2018, sp = TRUE)
+
+samples <- samples_tmp %>% 
+  as.data.frame() %>% 
+  dplyr::select(ID, predict = grep(colnames(.), pattern= "pred_mean"), coords.x1, coords.x2)
+  
+background <- background_tmp %>% 
+  as.data.frame() %>% 
+  dplyr::select(predict = grep(colnames(.), pattern= "pred_mean"), coords.x1, coords.x2)
+
+# get threshold: maxSSS averaged model
+# Load thresholds
+thresh_tmp <- read.csv(paste0(results_wd,"/maxent_mcp_results/maxentResults.csv"), header=TRUE)
+#Select maximum logistic threshold values for test data 
+threshold <- thresh_tmp[11,c(grep("Maximum.test.+logistic.threshold",names(thresh_tmp)))]
+  
+# get TSS
+test2_mcp_maxent_tss <- calc_tss(samples, background, threshold)  
+test2_mcp_maxent_tss
+# [1] 0.469218
+
+
+## continuous Boyce index (library: ecospat)
+# Requires the Habitat suitabilty predictions (below) and observation points
+source("./R/source_functions.R")
+boyce_ensemble_mcp_test2 <- ecospat.boyce.2(fit = mcp_EnsembleResult, 
+                                          obs = obs_mcp_test2_af2018_df, nclass = 0, method = 'spearman')
+boyce_ensemble_mcp_test2$cor
+# [1] 1
+
+saveRDS(boyce_ensemble_mcp_test2, paste0(results_wd ,"/ensemble_mcp_results/boyce_ensemble_mcp_test2.rds"))
+
+```
+
+
+------------------- TO DO EVALUATE END ------------------------
+
+
+
+# ENSEMBLE Combined
+
+we use data **before 2018**
+- presences: gps telemetry filtered by day and grid
+- background: random points (10x presences) selected in bias raster with 
+  prob 0.99 in 10km territory buffers and 0.01 outside, filtered by grid
+- Data divide into train (80%) and test (20%) sets
+
+Now we are going to use the points as spatialpointdataframe, and the environmental variables will be extracted from the rasters
+
+### Prepare data
+```{r load data}
+# environmental rasters
+env_germany <- rast(paste0(geoproc_wd, "/stack_env_rasters_germany_3035_AP.tif"))
+names(env_germany) <- c("CLC2012", "Pop_den", "HFP", "Dist_settl", "Dist_roads") 
+env_germany_fct <- env_germany
+env_germany_fct$CLC2012 <- as.factor(env_germany_fct$CLC2012)
+
+# Load observations with env data
+pres_gps_envcov_sf <- st_read(paste0(dataproc_wd, "/envcov_extract/envcov_pres_telemetry.gpkg")) %>% 
+  st_transform(crs = 3035)  
+
+# Select presences train and test data
+pres_gps_train <- pres_gps_envcov_sf %>% 
+  filter(type == "train") 
+pres_gps_test <- pres_gps_envcov_sf %>% 
+  filter(type == "test")  
+
+nrow(pres_gps_train) # [1] 2591
+nrow(pres_gps_test) # [1] 649
+
+
+# Load background
+bg_train_maxent_comb_grid <- st_read(paste0(dataproc_wd,"/bg_train_bf2018_maxent_comb_3035_AP.gpkg"))
+bg_test_maxent_comb_grid <- st_read(paste0(dataproc_wd,"/bg_test_bf2018_maxent_comb_3035_AP.gpkg"))
+```
+
+```{r train and test sets}
+## train data
+pres_train <- pres_gps_train %>% 
+  mutate(pres_bg = 1) %>% 
+  dplyr::select(pres_bg)
+
+bg_train <- bg_train_maxent_comb_grid %>% 
+          mutate(pres_bg = 0)
+
+comb_train <- rbind(pres_train, bg_train) %>% 
+   as_Spatial()
+
+## test data
+pres_test <- pres_gps_test %>% 
+  mutate(pres_bg = 1) %>% 
+  dplyr::select(pres_bg)
+
+bg_test <- bg_test_maxent_comb_grid %>% 
+          mutate(pres_bg = 0)
+
+comb_test <- rbind(pres_test, bg_test) %>% 
+   as_Spatial()
+
+```
+
+### prepare biomod object
+```{r biomod object}
+## preapre data
+ensemble_comb_dat <- BIOMOD_FormatingData(resp.name = "wolf_combined",
+                                          resp.var = comb_train,
+                                          expl.var = env_germany_fct,
+                                          eval.resp.var = comb_test,
+                                          filter.raster = TRUE)
+ensemble_comb_dat
+                                    
+## Define models
+# For maxent, we need to add some options to the models. 
+# Important, the directory where to find java/maxent. 
+# we also set the options for GAM to avoid an error for low number of values in the combination of parameters
+myBiomodOptions <- BIOMOD_ModelingOptions(
+  MAXENT = list( maximumiterations = 5000,
+                 responsecurves=TRUE,
+                 jacknife=TRUE,
+                 visible = FALSE,
+                 directory="/output/results_models/",
+                 linear = TRUE, 
+                 quadratic = TRUE,
+                 product = TRUE,
+                 threshold = FALSE,
+                 hinge = TRUE,
+                 lq2lqptthreshold = 80,
+                 l2lqthreshold = 10,
+                 hingethreshold = 15,
+                 beta_threshold = -1,
+                 beta_categorical = -1,
+                 beta_lqp = -1,
+                 beta_hinge = -1,
+                 defaultprevalence = 0.5),
+  GLM = list(family = "binomial"),
+  GAM = list( k = 5))
+```
+
+### run biomod models
+```{r run biomod}
+## models to run
+
+## models to run
+comb_mod_out <- BIOMOD_Modeling(bm.format = ensemble_comb_dat,
+                               bm.options = myBiomodOptions,
+                               models =c('GLM','GAM','GBM', 'MARS', 'ANN','RF','MAXENT'),
+                               modeling.id = 'AllModels', 
+                               nb.rep = 10,
+                               data.split.perc = 80,
+                               var.import = 10, 
+                               metric.eval = c("KAPPA", "TSS", "ROC"))
+
+saveRDS(comb_mod_out, paste0(results_wd, "/ensemble_comb_results/ensemble_comb_ind_models.rds"))
+
+
+
+
+
+# All models with AUC > 0.7
+comb_ensemblemod <- BIOMOD_EnsembleModeling(bm.mod = comb_mod_out,
+                                      models.chosen = 'all',
+                                      em.by = 'all',
+                                      em.algo = c('EMwmean'),
+                                      metric.select = c('ROC'),
+                                      metric.select.thresh = c(0.7),
+                                      metric.eval = c('TSS', 'ROC'),
+                                      var.import = 10,
+                                      EMci.alpha = 0.05,
+                                      EMwmean.decay = 'proportional')
+comb_ensemblemod
+saveRDS(comb_ensemblemod, paste0(results_wd, "/ensemble_comb_results/comb_ensemble_mod.rds"))
+# comb_ensemblemod  <- readRDS(paste0(results_wd, "/ensemble_comb_results/comb_ensemble_mod.rds"))
+
+
+str(comb_ensemblemod)
+
+env_germany <- rast(paste0(geoproc_wd, "/stack_env_rasters_germany_3035_AP.tif"))
+names(env_germany) <- c("CLC2012", "Pop_den", "HFP", "Dist_settl", "Dist_roads") 
+
+env_germany_fct <- env_germany
+env_germany_fct$CLC2012 <- as.factor(env_germany_fct$CLC2012)
+
+# Project ensemble models (building single projections)
+mcp_BiomodEMProj <- BIOMOD_EnsembleForecasting(bm.em = comb_ensemblemod,
+                                             proj.name = 'coomb_ensemble',
+                                             new.env = env_germany_fct)
+
+mcp_BiomodEMProj
+plot(mcp_BiomodEMProj)
+saveRDS(mcp_BiomodEMProj, paste0(results_wd, "/ensemble_comb_results/comb_ensemble_proj.rds"))
+
+
+
+
+
+
+
+
+
+
+## check output
+comb_mod_out
+str(comb_mod_out)
+comb_mod_out@models.computed
+saveRDS(comb_mod_out, paste0(results_wd, "/ensemble_comb_results/ensemble_comb_individuals_models.rds"))
+
+# get all models evaluation
+wolf_ModelEval <- get_evaluations(comb_mod_out)
+wolf_ModelEval
+
+# print the dimnames of this object
+dimnames(wolf_ModelEval)
+
+# get the AUC scores 
+(AUC_table <- wolf_ModelEval["ROC","Testing.data",,,])
+rowSums(AUC_table[,1:10])/10
+
+# get the TSS scores 
+(TSS_table <- wolf_ModelEval["TSS","Testing.data",,,])
+rowSums(TSS_table[,1:10])/10
+
+write.csv(AUC_table, paste0(results_wd, "/ensemble_comb_results/comb_AUCTable.csv"))
+write.csv(TSS_table, paste0(results_wd, "/ensemble_comb_results/comb_TSSTable.csv"))
+```
+
+```{r get variable importance}
+# print variable importances
+wolf_VarImpor <- get_variables_importance(comb_mod_out)
+wolf_VarImpor
+# Variable importance of the full model
+VarImpor_table <- wolf_VarImpor[,,"Full","AllData"]
+VarImpor_table
+write.csv(VarImpor_table, paste0(results_wd,
+                                 "/ensemble_comb_results/comb_VariableImportance_FullModel.csv"))
+
+## Average variable importance in the 10 model replicates
+# extract the matrices to a list
+wolf_VarImpor_list <- list()
+for (i in 1:10){
+  wolf_VarImpor_list[[i]] <- as.data.frame(wolf_VarImpor[,,i,])
+}
+
+for (i in 1:length(wolf_VarImpor_list)){
+  wolf_VarImpor_list[[i]]$RUN <- paste0("Run_", i)
+}
+
+wolf_VarImport_allmodels <- do.call(rbind, wolf_VarImpor_list)
+write.csv(wolf_VarImport_allmodels, paste0(results_wd,
+                                           "/ensemble_comb_results/comb_VariableImportance_avg.csv"))
+```
+
+### Create ensemble model
+```{r}
+### Building ensemble-models
+# All models with AUC > 0.7
+comb_ensemblemod <- BIOMOD_EnsembleModeling(
+  modeling.output = comb_mod_out,
+  chosen.models = 'all',
+  em.by='all', 
+  eval.metric = c('ROC'),
+  eval.metric.quality.threshold = c(0.7), # model above 0.7 AUC values
+  prob.mean.weight = T,
+  prob.mean.weight.decay = 'proportional')
+
+comb_ensemblemod
+saveRDS(comb_ensemblemod, paste0(results_wd, "/ensemble_comb_results/comb_ensemble_mod.rds"))
+comb_ensemblemod <- readRDS(paste0(results_wd, "/ensemble_comb_results/comb_ensemble_mod.rds"))
+
+# get evaluation scores
+get_evaluations(comb_ensemblemod)
+```
+
+$wolf.combined_EMwmeanByROC_mergedAlgo_mergedRun_mergedData
+      Testing.data Cutoff Sensitivity Specificity
+KAPPA        0.419  249.0      52.567      93.232
+TSS          0.569  145.0      81.166      75.993
+ROC          0.877  144.5      81.166      75.993
+
+```{r create raster}
+## Project ensemble-model
+comb_BiomodEF <- BIOMOD_EnsembleForecasting(EM.output = comb_ensemblemod,
+                            projection.output = NULL, 
+                            new.env = env_germany,
+                            selected.models = 'all',
+                            proj.name = "comb_data",
+                            compress = 'gzip')
+comb_BiomodEF
+saveRDS(comb_BiomodEF, paste0(results_wd, "/ensemble_comb_results/comb_ensemble_forcasting.rds"))
+
+comb_projEnsemble <- get_predictions(comb_BiomodEF)
+names(comb_projEnsemble)
+
+comb_EnsembleResult_wm <- comb_projEnsemble$comb_data_EMwmeanByROC_mergedAlgo_mergedRun_mergedData # weighted mean model based on AUC
+
+writeRaster(comb_EnsembleResult_wm,
+            filename = paste0(results_wd, "/ensemble_comb_results/comb_ensemble_weightedmean_projection_3035.tif"),
+            overwrite = T)
+
+
+mean_pred_ensemble_comb <- mean(comb_EnsembleResult_wm)
+
+pred_ensemble_comb_mask <- mean_pred_ensemble_comb %>%
+ mask(as(germany_3035, "Spatial"))
+
+plot(pred_ensemble_comb_mask)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# 1. using raster to extract env data
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+### Prepare data
+```{r load data}
+# Load observations with env data bf 2018
+tmp_pres_gps_bf2018 <- st_read(paste0(dataproc_wd, "/gps_points_bf2018_3035.gpkg")) %>% 
+  st_transform(crs = 3035)  
+  
+# Load background bf 2018
+tmp_bg_gps_bf2018 <- st_read(paste0(dataproc_wd,"/bg_mcp_bf2018_3035_AP.gpkg"))
+
+
+# put presences and background data together in one file
+pres_gps_bf2018 <- tmp_pres_gps_bf2018 %>% 
+  mutate(point_case = 1) %>% 
+  dplyr::select(point_case) 
+
+bg_mcp_bf2018 <- tmp_bg_gps_bf2018 %>%
+  mutate(point_case = 0) %>% 
+  dplyr::select(point_case) 
+
+mcp_points_bf2018 <- rbind(pres_gps_bf2018, bg_mcp_bf2018) 
+head(mcp_points_bf2018)
+
+# Data for validation
+pres_test2_mcp_sf <- st_read(paste0(dataproc_wd, "/gps_points_af2018_3035.gpkg"), crs = 3035)
+bg_test2_mcp_sf <- st_read(paste0(dataproc_wd, "/bg_test2_af2018_maxent_mcp_3035_AP.gpkg"), crs = 3035)
+
+# put presences and background data together 
+tmp_pres_af2018 <- pres_test2_mcp_sf %>% 
+  mutate(point_case = 1) %>% 
+  dplyr::select(point_case) 
+
+tmp_bg_mcp_af2018 <- bg_test2_mcp_sf %>%
+  mutate(point_case = 0) %>% 
+  dplyr::select(point_case) 
+
+mcp_points_af2018 <- rbind(tmp_pres_af2018, tmp_bg_mcp_af2018) 
+head(mcp_points_af2018)
+```
+
+```{r get points in spatvector format}
+mcp_points_bf2018 %>% 
+  as.data.frame() %>% 
+  group_by(point_case) %>% 
+  summarise(n = n())
+# 1       0  32400
+# 2       1   3240
+
+mcp_points_bf2018_spv <- vect(mcp_points_bf2018)
+head(values(mcp_points_bf2018_spv))
+tail(values(mcp_points_bf2018_spv))
+
+mcp_points_af2018 %>% 
+  as.data.frame() %>% 
+  group_by(point_case) %>% 
+  summarise(n = n())
+
+mcp_points_af2018_spv <- vect(mcp_points_af2018)
+```
+
+### prepare biomod object
+```{r biomod object}
+## Parameterize model options
+# For maxent, we need to add some options to the models. 
+# Important, the directory where to find java/maxent. 
+myBiomodOptions <- BIOMOD_ModelingOptions(
+  MAXENT = list( maximumiterations = 5000,
+                 responsecurves=TRUE,
+                 jacknife=TRUE,
+                 visible = FALSE,
+                 directory="/output/results/",
+                 linear = TRUE, 
+                 quadratic = TRUE,
+                 product = TRUE,
+                 threshold = FALSE,
+                 hinge = TRUE,
+                 lq2lqptthreshold = 80,
+                 l2lqthreshold = 10,
+                 hingethreshold = 15,
+                 beta_threshold = -1,
+                 beta_categorical = -1,
+                 beta_lqp = -1,
+                 beta_hinge = -1,
+                 defaultprevalence = 0.5),
+  GLM = list(family = "binomial"),
+  GAM = list( k = 5))
+
+
+## preapre data
+ensemble_mcp_dat <- BIOMOD_FormatingData(resp.var = mcp_points_bf2018_spv,
+                                     expl.var = env_germany_fct,
+                                     resp.name = "wolf_mcp_telemetry",
+                                     eval.resp.var = mcp_points_af2018_spv,
+                                     filter.raster = TRUE)
+ensemble_mcp_dat
+# plot(ensemble_mcp_dat)
+                            
+myBiomodOptions
+```
+
+### run biomod models
+```{r run biomod}
+## models to run
+mcp_mod_out <- BIOMOD_Modeling(bm.format = ensemble_mcp_dat,
+                               bm.options = myBiomodOptions,
+                               models =c('GLM','GAM','GBM', 'MARS', 'ANN','RF','MAXENT'),
+                               modeling.id = 'AllModels', 
+                               nb.rep = 10,
+                               data.split.perc = 80,
+                               var.import = 10, 
+                               metric.eval = c("KAPPA", "TSS", "ROC"))
+
+saveRDS(mcp_mod_out, paste0(results_wd, "/ensemble_mcp_results/ensemble_mcp_models.rds"))
+# mcp_mod_out <- readRDS(paste0(results_wd, "/ensemble_mcp_results/ensemble_mcp_models.rds"))
+
+## check output
+mcp_mod_out
+str(mcp_mod_out)
+mcp_mod_out@models.computed
+```
+
+### Create ensemble model
+```{r}
+### Building ensemble-models
+# All models with AUC > 0.7
+mcp_ensemblemod <- BIOMOD_EnsembleModeling(bm.mod = mcp_mod_out,
+                                      models.chosen = 'all',
+                                      em.by = 'all',
+                                      em.algo = c('EMwmean'),
+                                      metric.select = c('ROC'),
+                                      metric.select.thresh = c(0.7),
+                                      metric.eval = c('TSS', 'ROC'),
+                                      var.import = 10,
+                                      EMci.alpha = 0.05,
+                                      EMwmean.decay = 'proportional')
+mcp_ensemblemod
+saveRDS(mcp_ensemblemod, paste0(results_wd, "/ensemble_mcp_results/mcp_ensemble_mod.rds"))
+# mcp_ensemblemod <- readRDS(paste0(results_wd, "/ensemble_mcp_results/mcp_ensemble_mod.rds"))
+```
+
+### ensemble model evalutaions - TRAIN DATA
+```{r mcp eval1}
+# get evaluation scores for TSS and AUC
+ensemble_eval <- get_evaluations(mcp_ensemblemod)
+ensemble_eval %>% 
+  dplyr::select(algo, metric.eval, calibration)
+```
+     algo metric.eval calibration
+1 EMwmean         TSS       0.512
+2 EMwmean         ROC       0.849
+
+```{r mcp eval1}
+# get boyce index
+myBiomodPO <- BIOMOD_PresenceOnly(bm.mod = mcp_mod_out,
+                                  bm.em = mcp_ensemblemod)
+myBiomodPO %>% 
+  filter(metric.eval %in% c("BOYCE")) %>% 
+  filter(run == "allRun") %>% 
+  group_by(metric.eval) %>% 
+  summarise(calibration_mean = mean(calibration), 
+            validation_mean = mean(validation))
+        
+```
+metric.eval calibration_mean validation_mean
+1 BOYCE                  0.347           0.999
+
+
+### Project ensemble model
+```{r project mcp ensemble}
+str(mcp_ensemblemod)
+
+env_germany <- rast(paste0(geoproc_wd, "/stack_env_rasters_germany_3035_AP.tif"))
+names(env_germany) <- c("CLC2012", "Pop_den", "HFP", "Dist_settl", "Dist_roads") 
+
+env_germany_fct <- env_germany
+env_germany_fct$CLC2012 <- as.factor(env_germany_fct$CLC2012)
+
+# Project ensemble models (building single projections)
+mcp_BiomodEMProj <- BIOMOD_EnsembleForecasting(bm.em = mcp_ensemblemod,
+                                             proj.name = 'mcp_ensemble',
+                                             new.env = env_germany_fct)
+
+mcp_BiomodEMProj
+plot(mcp_BiomodEMProj)
+saveRDS(mcp_BiomodEMProj, paste0(results_wd, "/ensemble_mcp_results/mcp_ensemble_proj.rds"))
+```
+
