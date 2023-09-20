@@ -1237,12 +1237,6 @@ myBiomodPO %>%
 ```{r project mcp ensemble}
 str(mcp_ensemblemod)
 
-env_germany <- rast(paste0(geoproc_wd, "/stack_env_rasters_germany_3035_AP.tif"))
-names(env_germany) <- c("CLC2012", "Pop_den", "HFP", "Dist_settl", "Dist_roads") 
-
-env_germany_fct <- env_germany
-env_germany_fct$CLC2012 <- as.factor(env_germany_fct$CLC2012)
-
 # Project ensemble models (building single projections)
 mcp_BiomodEMProj <- BIOMOD_EnsembleForecasting(bm.em = mcp_ensemblemod,
                                              proj.name = 'mcp_ensemble',
@@ -1250,7 +1244,7 @@ mcp_BiomodEMProj <- BIOMOD_EnsembleForecasting(bm.em = mcp_ensemblemod,
 
 mcp_BiomodEMProj
 plot(mcp_BiomodEMProj)
-saveRDS(mcp_BiomodEMProj, paste0(results_wd, "/ensemble_mcp_results/mcp_ensemble_proj.rds"))
+# saveRDS(mcp_BiomodEMProj, paste0(results_wd, "/ensemble_mcp_results/mcp_ensemble_proj.rds"))
 ```
 
 
@@ -1296,87 +1290,6 @@ boyce_ensemble_mcp_test1$cor
 data >= 2018
 
 ```{r}
-# Load ensemble model and projection
-mcp_ensemblemod <- readRDS(paste0(results_wd, "/ensemble_mcp_results/mcp_ensemble_mod.rds"))
-
-get_evaluations(mcp_ensemblemod)
-
-evaluate(mcp_ensemblemod, test_mcp_covariates)
-
-
-
-
-
-
-head(DataSpecies)
-
-# the name of studied species
-myRespName <- 'GuloGulo'
-
-# the presence/absences data for our species 
-myResp <- as.numeric(DataSpecies[,myRespName])
-
-# the XY coordinates of species data
-myRespXY <- DataSpecies[,c("X_WGS84","Y_WGS84")]
-
-
-# Environmental variables extracted from BIOCLIM (bio_3, bio_4, bio_7, bio_11 & bio_12)
-myExpl = raster::stack( system.file( "external/bioclim/current/bio3.grd", 
-                     package="biomod2"),
-                system.file( "external/bioclim/current/bio4.grd", 
-                             package="biomod2"), 
-                system.file( "external/bioclim/current/bio7.grd", 
-                             package="biomod2"),  
-                system.file( "external/bioclim/current/bio11.grd", 
-                             package="biomod2"), 
-                system.file( "external/bioclim/current/bio12.grd", 
-                             package="biomod2"))
-
-# 1. Formatting Data
-myBiomodData <- BIOMOD_FormatingData(resp.var = myResp,
-                                     expl.var = myExpl,
-                                     resp.xy = myRespXY,
-                                     resp.name = myRespName)
-
-# 2. Defining Models Options using default options.
-myBiomodOption <- BIOMOD_ModelingOptions()
-
-# 3. Doing Modelisation
-
-myBiomodModelOut <- BIOMOD_Modeling( myBiomodData, 
-                                     models = c('SRE','CTA','RF'), 
-                                     models.options = myBiomodOption, 
-                                     NbRunEval=1, 
-                                     DataSplit=80, 
-                                     Yweights=NULL, 
-                                     VarImport=3, 
-                                     models.eval.meth = c('TSS'),
-                                     SaveObj = TRUE,
-                                     rescal.all.models = FALSE,
-                                     do.full.models = FALSE,
-                                     modeling.id='test')
-
-## creation of suitable dataset
-data <- cbind(GuloGulo=get_formal_data(mcp_ensemblemod,'resp.var'), 
-              get_formal_data(mcp_ensemblemod,'expl.var'))
-
-
-
-## evaluation
-biomod2::evaluate(myBiomodModelOut, data=data, stat=c('ROC','TSS'))
-
-
-
-
-
-
-
-
-
-
-
-
-
 ## Load test 2 data
 obs_mcp_test2_af2018 <- st_read(paste0(dataproc_wd, "/gps_points_eval_af2018_3035.gpkg"))
 obs_mcp_test2_af2018_df <- st_coordinates(obs_mcp_test2_af2018)
@@ -1386,23 +1299,8 @@ bg_mcp_test2_af2018 <- st_read(paste0(dataproc_wd,"/bg_test2_af2018_maxent_mcp_3
 bg_mcp_test2_af2018_df <- st_coordinates(bg_mcp_test2_af2018)
 nrow(bg_mcp_test2_af2018_df) # 6010
 
-# Load envir data
-env_germany <- stack(paste0(geoproc_wd, "/stack_env_rasters_germany_3035_AP.tif"))
-names(env_germany) <- c("CLC2012", "Pop_den", "HFP", "Dist_settl", "Dist_roads") 
-
 # Load predictions
-mcp_EnsembleResult <- rast(paste0(results_wd, "/ensemble_mcp_results/mcp_ensemble_weightedmean_projection_3035.tif"))
-
-
-
-
-
-get_evaluations(mcp_BiomodEMProj)
-
-
-
-
-
+# mcp_EnsembleResult <- rast(paste0(results_wd, "/ensemble_mcp_results/mcp_ensemble_weightedmean_projection_3035.tif"))
 
 
 ## AUC value
@@ -1420,27 +1318,20 @@ for (i in 1:length(eval_list_test2)){
 }
 
 mean(auc_list_test2)
-# [1] 0.655958
 
 plot(eval_list_test2[[1]],"ROC")
-
-# saveRDS(eval_list_test2, paste0(results_wd, "/maxent_mcp_results/maxent_mcp_model_eval_list_af2018.rds"))
 
 e <- eval_list_test2[[1]]
 threshold(e)
 plot(e, 'ROC')
-#plot(e, 'kappa')
-#plot(e, 'FPR')
-#plot(e, 'prevalence')
 boxplot(e)
-#density(e)
 
 ## tss function
 
 ## TSS value (we get predictions for samples nad background 
 # manually from prediction raster and coordinates)
 
-# Requires the Habitat suitabilty predictions (below)
+# Requires the Habitat suitabilty predictions 
 my_pred_raster <- list.files(paste0(results_wd ,"/maxent_mcp_results/"), 
                              pattern = c("pred_mean.+tif")) # filters for both patterns
 pred_mean_maxent_mcp <- rast(paste0(results_wd ,"/maxent_mcp_results/", my_pred_raster))
@@ -1721,12 +1612,6 @@ comb_ensemblemod <- readRDS(paste0(results_wd, "/ensemble_comb_results/comb_ense
 get_evaluations(comb_ensemblemod)
 ```
 
-$wolf.combined_EMwmeanByROC_mergedAlgo_mergedRun_mergedData
-      Testing.data Cutoff Sensitivity Specificity
-KAPPA        0.419  249.0      52.567      93.232
-TSS          0.569  145.0      81.166      75.993
-ROC          0.877  144.5      81.166      75.993
-
 ```{r create raster}
 ## Project ensemble-model
 comb_BiomodEF <- BIOMOD_EnsembleForecasting(EM.output = comb_ensemblemod,
@@ -1770,226 +1655,4 @@ plot(pred_ensemble_comb_mask)
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# 1. using raster to extract env data
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-### Prepare data
-```{r load data}
-# Load observations with env data bf 2018
-tmp_pres_gps_bf2018 <- st_read(paste0(dataproc_wd, "/gps_points_bf2018_3035.gpkg")) %>% 
-  st_transform(crs = 3035)  
-  
-# Load background bf 2018
-tmp_bg_gps_bf2018 <- st_read(paste0(dataproc_wd,"/bg_mcp_bf2018_3035_AP.gpkg"))
-
-
-# put presences and background data together in one file
-pres_gps_bf2018 <- tmp_pres_gps_bf2018 %>% 
-  mutate(point_case = 1) %>% 
-  dplyr::select(point_case) 
-
-bg_mcp_bf2018 <- tmp_bg_gps_bf2018 %>%
-  mutate(point_case = 0) %>% 
-  dplyr::select(point_case) 
-
-mcp_points_bf2018 <- rbind(pres_gps_bf2018, bg_mcp_bf2018) 
-head(mcp_points_bf2018)
-
-# Data for validation
-pres_test2_mcp_sf <- st_read(paste0(dataproc_wd, "/gps_points_af2018_3035.gpkg"), crs = 3035)
-bg_test2_mcp_sf <- st_read(paste0(dataproc_wd, "/bg_test2_af2018_maxent_mcp_3035_AP.gpkg"), crs = 3035)
-
-# put presences and background data together 
-tmp_pres_af2018 <- pres_test2_mcp_sf %>% 
-  mutate(point_case = 1) %>% 
-  dplyr::select(point_case) 
-
-tmp_bg_mcp_af2018 <- bg_test2_mcp_sf %>%
-  mutate(point_case = 0) %>% 
-  dplyr::select(point_case) 
-
-mcp_points_af2018 <- rbind(tmp_pres_af2018, tmp_bg_mcp_af2018) 
-head(mcp_points_af2018)
-```
-
-```{r get points in spatvector format}
-mcp_points_bf2018 %>% 
-  as.data.frame() %>% 
-  group_by(point_case) %>% 
-  summarise(n = n())
-# 1       0  32400
-# 2       1   3240
-
-mcp_points_bf2018_spv <- vect(mcp_points_bf2018)
-head(values(mcp_points_bf2018_spv))
-tail(values(mcp_points_bf2018_spv))
-
-mcp_points_af2018 %>% 
-  as.data.frame() %>% 
-  group_by(point_case) %>% 
-  summarise(n = n())
-
-mcp_points_af2018_spv <- vect(mcp_points_af2018)
-```
-
-### prepare biomod object
-```{r biomod object}
-## Parameterize model options
-# For maxent, we need to add some options to the models. 
-# Important, the directory where to find java/maxent. 
-myBiomodOptions <- BIOMOD_ModelingOptions(
-  MAXENT = list( maximumiterations = 5000,
-                 responsecurves=TRUE,
-                 jacknife=TRUE,
-                 visible = FALSE,
-                 directory="/output/results/",
-                 linear = TRUE, 
-                 quadratic = TRUE,
-                 product = TRUE,
-                 threshold = FALSE,
-                 hinge = TRUE,
-                 lq2lqptthreshold = 80,
-                 l2lqthreshold = 10,
-                 hingethreshold = 15,
-                 beta_threshold = -1,
-                 beta_categorical = -1,
-                 beta_lqp = -1,
-                 beta_hinge = -1,
-                 defaultprevalence = 0.5),
-  GLM = list(family = "binomial"),
-  GAM = list( k = 5))
-
-
-## preapre data
-ensemble_mcp_dat <- BIOMOD_FormatingData(resp.var = mcp_points_bf2018_spv,
-                                     expl.var = env_germany_fct,
-                                     resp.name = "wolf_mcp_telemetry",
-                                     eval.resp.var = mcp_points_af2018_spv,
-                                     filter.raster = TRUE)
-ensemble_mcp_dat
-# plot(ensemble_mcp_dat)
-                            
-myBiomodOptions
-```
-
-### run biomod models
-```{r run biomod}
-## models to run
-mcp_mod_out <- BIOMOD_Modeling(bm.format = ensemble_mcp_dat,
-                               bm.options = myBiomodOptions,
-                               models =c('GLM','GAM','GBM', 'MARS', 'ANN','RF','MAXENT'),
-                               modeling.id = 'AllModels', 
-                               nb.rep = 10,
-                               data.split.perc = 80,
-                               var.import = 10, 
-                               metric.eval = c("KAPPA", "TSS", "ROC"))
-
-saveRDS(mcp_mod_out, paste0(results_wd, "/ensemble_mcp_results/ensemble_mcp_models.rds"))
-# mcp_mod_out <- readRDS(paste0(results_wd, "/ensemble_mcp_results/ensemble_mcp_models.rds"))
-
-## check output
-mcp_mod_out
-str(mcp_mod_out)
-mcp_mod_out@models.computed
-```
-
-### Create ensemble model
-```{r}
-### Building ensemble-models
-# All models with AUC > 0.7
-mcp_ensemblemod <- BIOMOD_EnsembleModeling(bm.mod = mcp_mod_out,
-                                      models.chosen = 'all',
-                                      em.by = 'all',
-                                      em.algo = c('EMwmean'),
-                                      metric.select = c('ROC'),
-                                      metric.select.thresh = c(0.7),
-                                      metric.eval = c('TSS', 'ROC'),
-                                      var.import = 10,
-                                      EMci.alpha = 0.05,
-                                      EMwmean.decay = 'proportional')
-mcp_ensemblemod
-saveRDS(mcp_ensemblemod, paste0(results_wd, "/ensemble_mcp_results/mcp_ensemble_mod.rds"))
-# mcp_ensemblemod <- readRDS(paste0(results_wd, "/ensemble_mcp_results/mcp_ensemble_mod.rds"))
-```
-
-### ensemble model evalutaions - TRAIN DATA
-```{r mcp eval1}
-# get evaluation scores for TSS and AUC
-ensemble_eval <- get_evaluations(mcp_ensemblemod)
-ensemble_eval %>% 
-  dplyr::select(algo, metric.eval, calibration)
-```
-     algo metric.eval calibration
-1 EMwmean         TSS       0.512
-2 EMwmean         ROC       0.849
-
-```{r mcp eval1}
-# get boyce index
-myBiomodPO <- BIOMOD_PresenceOnly(bm.mod = mcp_mod_out,
-                                  bm.em = mcp_ensemblemod)
-myBiomodPO %>% 
-  filter(metric.eval %in% c("BOYCE")) %>% 
-  filter(run == "allRun") %>% 
-  group_by(metric.eval) %>% 
-  summarise(calibration_mean = mean(calibration), 
-            validation_mean = mean(validation))
-        
-```
-metric.eval calibration_mean validation_mean
-1 BOYCE                  0.347           0.999
-
-
-### Project ensemble model
-```{r project mcp ensemble}
-str(mcp_ensemblemod)
-
-env_germany <- rast(paste0(geoproc_wd, "/stack_env_rasters_germany_3035_AP.tif"))
-names(env_germany) <- c("CLC2012", "Pop_den", "HFP", "Dist_settl", "Dist_roads") 
-
-env_germany_fct <- env_germany
-env_germany_fct$CLC2012 <- as.factor(env_germany_fct$CLC2012)
-
-# Project ensemble models (building single projections)
-mcp_BiomodEMProj <- BIOMOD_EnsembleForecasting(bm.em = mcp_ensemblemod,
-                                             proj.name = 'mcp_ensemble',
-                                             new.env = env_germany_fct)
-
-mcp_BiomodEMProj
-plot(mcp_BiomodEMProj)
-saveRDS(mcp_BiomodEMProj, paste0(results_wd, "/ensemble_mcp_results/mcp_ensemble_proj.rds"))
-```
 
