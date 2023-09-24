@@ -1,0 +1,1151 @@
+---
+title: "ensemble model"
+author: "Aimara Planillo"
+date: "3/11/2021"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+####--------------------------------------------####
+### WORKSPACE
+####--------------------------------------------####
+
+
+workDir <- getwd()
+
+dataraw_wd <- paste0(workDir, "/data-raw")
+dataproc_wd <- paste0(workDir, "/output/data-proc")
+geoproc_wd <- paste0(workDir, "/output/geo-proc")
+plots_wd <- paste0(workDir, "/plots")
+if (!dir.exists(paste0(workDir, "/output/results_models"))) dir.create(paste0(workDir, "/output/results_models"))
+results_wd <- paste0(workDir, "/output/results_models")
+
+```{r}
+# libraries and functions
+source("./R/source_file.R")
+```
+
+
+# Ensemble model for Wolf Habitat Suitability in Germany
+
+Based on the results of the model comparison and performance on the test data and the 
+extra evaluation set, we are going to use the telemetry data as presences and the 
+territory buffers from the monitoring as background, with data from all years together
+to obtain the most robust model to predict habitat suitability for the establishment 
+of wolf territories in Germany.
+
+The ensemble model is the method selected because it combines the strengths of multiple
+modelling techniques, given a consensus model built from all individual models, weighting 
+them by their accuracy, in this case AUC.
+
+We follow the workflow that was already proposed in Biomod2
+
+
+##-------------------------------------------##
+
+
+# Same background points as presences
+
+### Load data
+```{r}
+# environmental rasters
+env_germany <- stack(paste0(geoproc_wd, "/stack_env_rasters_germany_3035_AP.tif"))
+names(env_germany) <- c("CLC2012", "Pop_den", "HFP", "Dist_settl", "Dist_roads") 
+
+
+### Wolf telemetry data (all years) ###
+
+# Load observations with env data bf 2018
+pres_gps_bf2018_envcov_sf <- st_read(paste0(dataproc_wd, "/envcov_extract/envcov_pres_telemetry.gpkg")) %>% 
+  st_transform(crs = 3035)  
+table(pres_gps_envcov_sf$type) 
+# test train 
+#   649  2591 
+# TOTAL: 3240
+
+# Load observation af 2018
+pres_gps_af2018_envcov_sf <- st_read(paste0(dataproc_wd,"/envcov_extract/envcov_pres_telemetry_af2018.gpkg")) %>% 
+  st_transform(crs = 3035)
+nrow(pres_gps_af2018_envcov_sf) # 601
+
+# Put all presences in one data frame
+colnames(pres_gps_bf2018_envcov_sf)
+colnames(pres_gps_af2018_envcov_sf)
+
+wolf_pres <- pres_gps_bf2018_envcov_sf %>% 
+  dplyr::select(-c(type, fold)) %>% 
+  rbind(pres_gps_af2018_envcov_sf)
+
+wolf_pres # 3841 features (3240 + 601)
+
+
+### Background data ###
+bg_comb_bf2018 <- st_read(paste0(dataproc_wd,"/envcov_extract/envcov_bg_combined_maxent.gpkg"))
+bg_comb2_af2018 <- st_read(paste0(dataproc_wd,"/envcov_extract/envcov_bg_comb_maxent_af2018.gpkg")) %>% 
+   st_transform(crs = 3035) 
+
+nrow(bg_comb_bf2018) # [1] 32317
+nrow(bg_comb2_af2018) # 6009
+
+# Put all background in one data frame
+colnames(bg_comb_bf2018)
+colnames(bg_comb2_af2018)
+
+wolf_bg <- bg_comb_bf2018 %>% 
+  dplyr::select(-c(type)) %>% 
+  rbind(bg_comb2_af2018) 
+
+wolf_bg # 38326  features (32317 + 6009)
+
+### Divide into train and test data (4:1 - 80%-20%)
+# Presences
+wolf_pres$fold <- kfold(wolf_pres, k = 5)
+wolf_pres <- wolf_pres %>% 
+  mutate(type = ifelse(fold == 5, "test", "train"), 
+         data = "presences")
+  
+wolf_pres_train <- wolf_pres %>% 
+  filter(fold != 5)
+wolf_pres_test <- wolf_pres %>% 
+  filter(fold == 5)
+nrow(wolf_pres_train) #3073
+nrow(wolf_pres_test) #768
+
+
+## Select same number of points as number of presences
+wolf_bg$id <- seq(1:nrow(wolf_bg))
+bg_sample <- sample(wolf_bg$id, nrow(wolf_pres))
+
+wolf_bg <- wolf_bg[wolf_bg$id %in% bg_sample,]
+
+# Background
+wolf_bg$fold <- kfold(wolf_bg, k = 5)
+wolf_bg <- wolf_bg %>% 
+  dplyr::select(-id) %>% 
+  mutate(type = ifelse(fold == 5, "test", "train"), 
+         data = "background")
+
+wolf_bg_train <- wolf_bg %>% 
+  filter(fold != 5)
+wolf_bg_test <- wolf_bg %>% 
+  filter(fold == 5)
+nrow(wolf_bg_train) #3073
+nrow(wolf_bg_test) #768
+
+
+### Put all togheter and safe
+head(wolf_pres)
+head(wolf_bg)
+
+
+all_wolf_points <- wolf_pres %>% 
+  dplyr::select(CLC2012:data) %>% 
+  rbind(wolf_bg)
+
+str(all_wolf_points)
+table(all_wolf_points$data, all_wolf_points$type)
+
+# st_write(all_wolf_points, paste0(dataproc_wd, "/all_wolf_points_samebgpres_ensemble_3035.gpkg"))
+# all_wolf_points <- st_read(paste0(dataproc_wd, "/all_wolf_points_samebgpres_ensemble_3035.gpkg")) %>% 
+#   st_transform(crs = 3035)
+
+```
+
+
+## Run models
+
+```{r}
+## Formating data
+# Transform points into presence (1) - absence (0) and divide into train and test sets
+wolf_dat_train <- all_wolf_points %>% 
+  filter(fold != 5) %>% 
+  mutate(pres_bg = case_when(
+    data == "presences" ~ 1,
+    data == "background" ~ 0)) %>% 
+  dplyr::select(pres_bg) %>% 
+  as_Spatial()
+wolf_dat_train
+table(wolf_dat_train$pres_bg)
+#     0     1 
+# 3073   3073  
+nrow(wolf_dat_train) # 6146
+
+wolf_dat_test <- all_wolf_points %>% 
+  filter(fold == 5) %>% 
+  mutate(pres_bg = case_when(
+    data == "presences" ~ 1,
+    data == "background" ~ 0)) %>% 
+  dplyr::select(pres_bg) %>% 
+  as_Spatial()
+
+wolf_dat_test
+table(wolf_dat_test$pres_bg)
+#    0    1 
+# 768   768 
+nrow(wolf_dat_test) # 1536
+
+
+## Extract environmental covariates
+head(all_wolf_points)
+
+my_covariates_train <- all_wolf_points %>%
+  filter(fold != 5) %>% 
+  as.data.frame() %>% 
+  dplyr::select(CLC2012:Dist_roads) %>% 
+  mutate(CLC2012 = as.factor(as.character(CLC2012)))
+head(my_covariates_train)
+str(my_covariates_train) # 6146  obs. of  5 variables
+
+my_covariates_test <- all_wolf_points %>%
+  filter(fold == 5) %>% 
+  as.data.frame() %>% 
+  dplyr::select(CLC2012:Dist_roads) %>% 
+  mutate(CLC2012 = as.factor(as.character(CLC2012)))
+head(my_covariates_test)
+str(my_covariates_test) #1536  obs. of  5 variables
+
+
+wolf_mod_dat <- BIOMOD_FormatingData(resp.var = wolf_dat_train,
+                                     # expl.var = env_germany,
+                                     expl.var = my_covariates_train,
+                                     #eval.resp.var = ,
+                                     #PA.strategy = "random",
+                                     #PA.nb.rep = 0, # common practice to resample!
+                                     #PA.nb.absences = 0,
+                                     resp.name = "Wolf_2")
+wolf_mod_dat
+                                    
+                                    
+## Define models
+# For maxent, we need to add some options to the models. 
+# Important, the directory where to find java/maxent. 
+myBiomodOptions <- BIOMOD_ModelingOptions(
+  MAXENT.Phillips = list( path_to_maxent.jar = "C:/TEMP/maxent.jar",
+                          maximumiterations = 5000,
+                          responsecurves=TRUE,
+                          jacknife=TRUE,
+                          replicates=3,
+                          visible = FALSE,
+                          directory="/Wolf_2/",
+                          linear = TRUE, 
+                          quadratic = TRUE,
+                          product = TRUE,
+                          threshold = FALSE,
+                          hinge = TRUE,
+                          lq2lqptthreshold = 80,
+                          l2lqthreshold = 10,
+                          hingethreshold = 15,
+                          beta_threshold = -1,
+                          beta_categorical = -1,
+                          beta_lqp = -1,
+                          beta_hinge = -1,
+                          defaultprevalence = 0.5))
+
+wolf_mod_out <- BIOMOD_Modeling(data = wolf_mod_dat,
+                            models =c('GLM','GAM','GBM', 'MARS', 'ANN','RF','MAXENT.Phillips'),
+                            SaveObj = TRUE,
+                           models.options = myBiomodOptions,
+                           NbRunEval = 10,
+                           DataSplit = 80, # common practice to validate: 80 train, 20 test
+                           models.eval.meth = c('KAPPA','TSS','ROC'),
+                           VarImport = 10)
+
+wolf_mod_out
+str(wolf_mod_out)
+wolf_mod_out@models.computed
+# saveRDS(wolf_mod_out, paste0(results_wd, "/ensemble_results/all_models_wolf_samebgpres_train80.rds"))
+# wolf_mod_out <- readRDS(paste0(results_wd, "/ensemble_results/all_models_wolf_samebgpres_train80.rds"))
+
+# get all models evaluation
+wolf_ModelEval <- get_evaluations(wolf_mod_out)
+wolf_ModelEval
+# print the dimnames of this object
+dimnames(wolf_ModelEval)
+
+# get the AUC scores 
+(AUC_table <- wolf_ModelEval["ROC","Testing.data",,,])
+rowSums(AUC_table[,1:10])/10
+
+# get the TSS scores 
+(TSS_table <- wolf_ModelEval["TSS","Testing.data",,,])
+rowSums(TSS_table[,1:10])/10
+
+# write.csv(AUC_table, paste0(results_wd, "/ensemble_results/all_models_samebgpres_AUCTable.csv"))
+# write.csv(TSS_table, paste0(results_wd, "/ensemble_results/all_models_samebgpres_TSSTable.csv"))
+```
+
+## get variable importance
+For the machine learning algorithms ANN and GBM, the AIC approach is not applicable because there is no model log-likelihood information available. Therefore, we have included the variable importance function that is implemented in the biomod2 package. This function uses a machine-learning approach once the models are trained to randomize one of the variables in each permutation and calculate a correlation score between the standard prediction and the new prediction. This score is considered to give an estimation of the variable importance in the model. The higher the value, the more importance the predictor variable has on the model. A value of 0 assumes no influence of that predictor. Note that this method does not account for interactions between variables and should be considered more as an information tool for each model independently.
+```{r}
+# print variable importances
+wolf_VarImpor <- get_variables_importance(wolf_mod_out)
+wolf_VarImpor
+# Variable importance of the full model
+VarImpor_table <- wolf_VarImpor[,,"Full","AllData"]
+VarImpor_table
+# write.csv(VarImpor_table, paste0(results_wd, "/ensemble_results/all_models_samebgpres_VariableImportance_FullModel.csv"))
+
+
+## Average variable importance in the 10 model replicates
+# extract the matrices to a list
+wolf_VarImpor_list <- list()
+for (i in 1:10){
+  wolf_VarImpor_list[[i]] <- as.data.frame(wolf_VarImpor[,,i,])
+}
+
+for (i in 1:length(wolf_VarImpor_list)){
+  wolf_VarImpor_list[[i]]$RUN <- paste0("Run_", i)
+}
+
+wolf_VarImport_allmodels <- do.call(rbind, wolf_VarImpor_list)
+# write.csv(wolf_VarImport_allmodels, paste0(results_wd, "/ensemble_results/all_models_samebgpres_VariableImportance.csv"))
+
+
+
+##Varible contributions for Maxent, not possible this method for other models
+forSetup <- read.csv(file = paste("./Wolf.2/models/1618066184/Wolf.2_AllData_Full_MAXENT.Phillips_outputs/maxentResults.csv", 
+                                  sep = ""), header = T)#Choose the appropriate model folder with the seed of the analysis you want
+variableContributions <- matrix(data = NA, nrow = length(forSetup[, grep('.contribution', names(forSetup))]), ncol = 10);
+rownames(variableContributions) <- names(forSetup[, grep('.contribution', names(forSetup))])
+colnames(variableContributions) <- c("Run1", "Run2", "Run3", "Run4", "Run5", "Run6", "Run7", "Run8", "Run9", "Run10")
+variablePermutationImportance <- matrix(data = NA, nrow = length(forSetup[, grep('.permutation.importance', names(forSetup))]), ncol = 10);
+colnames(variablePermutationImportance) <- c("Run1", "Run2", "Run3", "Run4", "Run5", "Run6", "Run7", "Run8", "Run9", "Run10")
+count <- 1;
+while (count <= 10){
+  temporary <- read.csv(file = paste("./Wolf/models/1617188603/Wolf_AllData_RUN", count, "_MAXENT.Phillips_outputs/maxentResults.csv", sep = ""), header = T);
+  variableContributions[,count] <- unlist(unname(temporary[, grep('.contribution', names(temporary))]))
+  variablePermutationImportance[,count] <- unlist(unname(temporary[, grep('.permutation.importance', names(temporary))]))
+  count <- count + 1;
+}
+# write.csv(variableContributions, paste0(results_wd, "/ensemble_results/Maxent_samebgpres_VariableContributions.csv"))
+# write.csv(variablePermutationImportance, paste0(results_wd,
+                                                # "/ensemble_results/Maxent_samebgpres/VariablePermutationImportance.csv"))
+
+
+
+# response curves
+## Variable response curves
+response.plot2(models = BIOMOD_LoadModels(wolf_mod_out, models='MAXENT.Phillips'),
+               Data = get_formal_data(wolf_mod_out,'expl.var'),
+               show.variables= get_formal_data(wolf_mod_out,'expl.var.names'),
+               do.bivariate = FALSE,
+               fixed.var.metric = 'mean',
+               col = brewer.pal(10, "Spectral"),
+               legend = TRUE,
+               data_species = get_formal_data(wolf_mod_out,'resp.var'))
+```
+
+
+## Make ensemble
+```{r}
+### Building ensemble-models
+# All models with AUC > 0.7
+wolf_ensemblemod <- BIOMOD_EnsembleModeling(
+  modeling.output = wolf_mod_out,
+  chosen.models = 'all',
+  em.by='all', 
+  eval.metric = c('ROC'),
+  eval.metric.quality.threshold = c(0.7), # model above 0.7 AUC values
+  prob.mean = T,
+  prob.cv = T,
+  prob.ci = T,
+  prob.ci.alpha = 0.05,
+  prob.median = T,
+  committee.averaging = T,
+  prob.mean.weight = T,
+  prob.mean.weight.decay = 'proportional')
+
+wolf_ensemblemod
+# saveRDS(wolf_ensemblemod, paste0(results_wd, "/ensemble_results/ensemble_wolf_samebgpres.rds"))
+wolf_ensemblemod <- readRDS(paste0(results_wd, "/ensemble_results/ensemble_wolf_samebgpres.rds"))
+# get evaluation scores
+scores_all <- get_evaluations(wolf_ensemblemod)
+threshold <- scores_all$Wolf.2_EMwmeanByROC_mergedAlgo_mergedRun_mergedData["TSS", "Cutoff"]
+threshold
+#498
+```
+
+
+## Project models
+```{r}
+### Project individual models
+wolf_BiomodProj <- BIOMOD_Projection(
+  modeling.output = wolf_mod_out,
+  new.env = env_germany,
+  proj.name = 'ind_models',
+  selected.models = 'all',
+  compress = 'gzip',
+  build.clamping.mask = F,
+  output.format = '.grd', 
+  do.stack=T)
+
+wolf_BiomodProj
+# saveRDS(wolf_BiomodProj, paste0(results_wd, "/ensemble_results/all_models_samebgpres_biomod_projection.rds"))
+# names(wolf_BiomodProj)
+# wolf_BiomodProj <- readRDS(paste0(results_wd, "/ensemble_results/all_models_samebgpres_biomod_projection.rds"))
+
+names(wolf_BiomodProj)
+
+
+# make some plots sub-selected by str.grep argument
+plot(wolf_BiomodProj, str.grep ='RF')
+
+# to make custom plots, get the projected map
+wolf_indmodelProj <- get_predictions(wolf_BiomodProj)
+wolf_indmodelProj
+wolf_Result <- calc(wolf_indmodelProj,fun = mean); #Choose whatever descriptive statistic you'd like
+plot(wolf_Result)
+# writeRaster(wolf_Result, filename = paste0(results_wd, "/ensemble_results/all_models_samebgpres_mean_projection_3035.tif"),
+#             overwrite = T);
+
+## Project ensemble-model
+wolf_BiomodEF <- BIOMOD_EnsembleForecasting(EM.output = wolf_ensemblemod,
+                            projection.output = wolf_BiomodProj,
+                            selected.models = 'all',
+                            compress = 'gzip')
+wolf_BiomodEF
+# saveRDS(wolf_BiomodEF, paste0(results_wd, "/ensemble_results/ensemble_samebgpres_forcasting.rds"))
+# wolf_BiomodEF <- readRDS(paste0(results_wd, "/ensemble_results/ensemble_samebgpres_forcasting.rds"))
+
+wolf_projEnsemble <- get_predictions(wolf_BiomodEF)
+names(wolf_projEnsemble)
+wolf_EnsembleResult <- wolf_projEnsemble[[1]] #This is the mean model ensemble across all models
+wolf_EnsembleResult_wm <- wolf_projEnsemble$Wolf.2_EMwmeanByROC_mergedAlgo_mergedRun_mergedData # weighted mean model based on AUC
+plot(wolf_EnsembleResult)
+plot(wolf_EnsembleResult_wm)
+
+# writeRaster(wolf_EnsembleResult, filename = paste0(results_wd, 
+#                                                    "/ensemble_results/ensemble_samebgpres_mean_projection_3035.tif"),
+#             overwrite = T)
+# writeRaster(wolf_EnsembleResult_wm,
+#             filename = paste0(results_wd, "/ensemble_results/ensemble_samebgpres_weightedmean_projection_3035.tif"),
+#             overwrite = T)
+```
+
+
+## Plot individual models
+```{r}
+# wolf_BiomodProj <- readRDS(paste0(results_wd, "/ensemble_results/all_models_samebgpres_biomod_projection.rds"))
+# wolf_projections <- stack("./Wolf.2/proj_ind_models/proj_ind_models_Wolf.grd")
+
+# plot fancy map for MAXENT
+wolf_Maxent_pred <- wolf_indmodelProj$Wolf.2_AllData_Full_MAXENT.Phillips
+# writeRaster(wolf_Maxent_pred, filename = paste0(results_wd,
+#                                                 "/ensemble_results/all_models_samebgpres_Maxent_projection_3035.tif"),
+#             overwrite = T)
+
+
+# convert to a df for plotting in two steps,
+# First, to a SpatialPointsDataFrame
+wolf_maxent_pts <- rasterToPoints(wolf_Maxent_pred, spatial = TRUE)
+# Then to a 'conventional' dataframe
+wolf_maxent_df  <- data.frame(wolf_maxent_pts)
+wolf_maxent_df$maxent <- wolf_maxent_df$Wolf.2_AllData_Full_MAXENT.Phillips/1000
+
+wolf_maxent_map <- ggplot(data = wolf_maxent_df, aes(y=y, x=x)) +
+  geom_raster(aes(fill=maxent)) +
+  # geom_point(data=sites, aes(x=x, y=y), color=”white”, size=3, shape=4) +
+  theme_bw() +
+  coord_equal() +
+  scale_fill_viridis(limits = c(0, 1),
+                       "Maxent \nHabitat Suitability") +
+  theme(axis.title.x = element_text(size=16),
+        axis.title.y = element_text(size=16, angle=90),
+        axis.text.x = element_text(size=14),
+        axis.text.y = element_text(size=14),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.position = "right",
+        legend.key = element_blank())
+
+ggsave(plot = wolf_maxent_map, filename = paste0(plots_wd, "/Plot_MAP_Wolf_HabitatSuitability_Maxent_equalbgpres.tif"),
+       device ='tiff', 
+       dpi = 700, height = 8, width = 6)
+
+
+# plot fancy map for Random Forest
+wolf_RF_pred <- wolf_indmodelProj$Wolf.2_AllData_Full_RF
+# writeRaster(wolf_RF_pred, filename = paste0(results_wd, "/ensemble_results/all_models_samebgpres_RF_projection_3035.tif"))
+
+# convert to a df for plotting in two steps,
+# First, to a SpatialPointsDataFrame
+wolf_RF_pts <- rasterToPoints(wolf_RF_pred, spatial = TRUE)
+# Then to a 'conventional' dataframe
+wolf_RF_df  <- data.frame(wolf_RF_pts)
+wolf_RF_df$RF <- wolf_RF_df$Wolf.2_AllData_Full_RF/1000
+
+wolf_RF_map <- ggplot(data = wolf_RF_df, aes(y=y, x=x)) +
+  geom_raster(aes(fill=RF)) +
+  # geom_point(data=sites, aes(x=x, y=y), color=”white”, size=3, shape=4) +
+  theme_bw() +
+  coord_equal() +
+  scale_fill_viridis(limits = c(0, 1),
+                       "RF \nHabitat Suitability") +
+  theme(axis.title.x = element_text(size=16),
+        axis.title.y = element_text(size=16, angle=90),
+        axis.text.x = element_text(size=14),
+        axis.text.y = element_text(size=14),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.position = "right",
+        legend.key = element_blank())
+
+ggsave(plot = wolf_RF_map, filename = paste0(plots_wd, "/Plot_MAP_Wolf_HabitatSuitability_RF_equalbgpres.tif"),
+       device ='tiff', 
+       dpi = 700, height = 8, width = 6)
+
+
+```
+
+
+## Plot ensemble
+```{r}
+# wolf_EnsembleResult_wm <- raster(paste0(results_wd, "/ensemble_results/ensemble_weightedmean_projection_3035.tif"))
+
+# plot fancy map
+# convert to a df for plotting in two steps,
+# First, to a SpatialPointsDataFrame
+wolf_EF_pts <- rasterToPoints(wolf_EnsembleResult_wm, spatial = TRUE)
+# Then to a 'conventional' dataframe
+wolf_EF_df  <- data.frame(wolf_EF_pts)
+wolf_EF_df$HS <- wolf_EF_df$Wolf.2_EMwmeanByROC_mergedAlgo_mergedRun_mergedData/1000
+
+wolf_EF_map <- ggplot(data = wolf_EF_df, aes(y=y, x=x)) +
+  geom_raster(aes(fill=HS)) +
+  # geom_point(data=sites, aes(x=x, y=y), color=”white”, size=3, shape=4) +
+  theme_bw() +
+  coord_equal() +
+  scale_fill_viridis(limits = c(0, 1),
+                       "Habitat Suitability") +
+  theme(axis.title.x = element_text(size=16),
+        axis.title.y = element_text(size=16, angle=90),
+        axis.text.x = element_text(size=14),
+        axis.text.y = element_text(size=14),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.position = "right",
+        legend.key = element_blank())
+
+ggsave(plot = wolf_EF_map, filename = paste0(plots_wd, "/Plot_MAP_Wolf_HabitatSuitability_Ensemble_equalbgpres.tif"),
+       device ='tiff', 
+       dpi = 700, height = 8, width = 6)
+```
+
+
+
+
+
+
+
+
+##-------------------------------------------##
+##--- OLD -----------------------------------##
+##-------------------------------------------##
+
+
+
+# 10 times background points than presences
+
+### Load data
+```{r}
+# environmental rasters
+env_germany <- stack(paste0(geoproc_wd, "/stack_env_rasters_germany_3035_AP.tif"))
+names(env_germany) <- c("CLC2012", "Pop_den", "HFP", "Dist_settl", "Dist_roads") 
+### Wolf telemetry data (all years) ###
+
+# Load observations with env data bf 2018
+pres_gps_bf2018_envcov_sf <- st_read(paste0(dataproc_wd, "/envcov_extract/envcov_pres_telemetry.gpkg")) %>% 
+  st_transform(crs = 3035)  
+table(pres_gps_envcov_sf$type) 
+# test train 
+#   649  2591 
+# TOTAL: 3240
+
+# Load observation af 2018
+pres_gps_af2018_envcov_sf <- st_read(paste0(dataproc_wd,"/envcov_extract/envcov_pres_telemetry_af2018.gpkg")) %>% 
+  st_transform(crs = 3035)
+nrow(pres_gps_af2018_envcov_sf) # 601
+
+# Put all presences in one data frame
+colnames(pres_gps_bf2018_envcov_sf)
+colnames(pres_gps_af2018_envcov_sf)
+
+wolf_pres <- pres_gps_bf2018_envcov_sf %>% 
+  dplyr::select(-c(type, fold)) %>% 
+  rbind(pres_gps_af2018_envcov_sf)
+
+wolf_pres # 3841 features (3240 + 601)
+
+
+### Background data ###
+bg_comb_bf2018 <- st_read(paste0(dataproc_wd,"/envcov_extract/envcov_bg_combined_maxent.gpkg"))
+bg_comb2_af2018 <- st_read(paste0(dataproc_wd,"/envcov_extract/envcov_bg_comb_maxent_af2018.gpkg")) %>% 
+   st_transform(crs = 3035) 
+
+nrow(bg_comb_bf2018) # [1] 32317
+nrow(bg_comb2_af2018) # 6009
+
+# Put all background in one data frame
+colnames(bg_comb_bf2018)
+colnames(bg_comb2_af2018)
+
+wolf_bg <- bg_comb_bf2018 %>% 
+  dplyr::select(-c(type)) %>% 
+  rbind(bg_comb2_af2018)
+
+wolf_bg # 38326  features (32317 + 6009)
+
+### Divide into train and test data (4:1 - 80%-20%)
+# Presences
+wolf_pres$fold <- kfold(wolf_pres, k = 5)
+wolf_pres <- wolf_pres %>% 
+  mutate(type = ifelse(fold == 5, "test", "train"), 
+         data = "presences")
+  
+wolf_pres_train <- wolf_pres %>% 
+  filter(fold != 5)
+wolf_pres_test <- wolf_pres %>% 
+  filter(fold == 5)
+nrow(wolf_pres_train) #3073
+nrow(wolf_pres_test) #768
+
+# Background
+wolf_bg$fold <- kfold(wolf_bg, k = 5)
+wolf_bg <- wolf_bg %>% 
+  mutate(type = ifelse(fold == 5, "test", "train"), 
+         data = "background")
+
+wolf_bg_train <- wolf_bg %>% 
+  filter(fold != 5)
+wolf_bg_test <- wolf_bg %>% 
+  filter(fold == 5)
+nrow(wolf_bg_train) #30661
+nrow(wolf_bg_test) #7665
+
+
+### Put all togheter and safe
+head(wolf_pres)
+head(wolf_bg)
+
+
+all_wolf_points <- wolf_pres %>% 
+  dplyr::select(CLC2012:data) %>% 
+  rbind(wolf_bg)
+
+str(all_wolf_points)
+table(all_wolf_points$data, all_wolf_points$type)
+
+# st_write(all_wolf_points, paste0(dataproc_wd, "/all_wolf_points_ensemble_3035.gpkg"))
+# all_wolf_points <- st_read(paste0(dataproc_wd, "/all_wolf_points_ensemble_3035.gpkg")) %>% 
+#   st_transform(crs = 3035)
+
+```
+
+
+
+## Ensemble model 
+Following Olson et al. 2021 (Lynx regional and populations sdm)
+
+Using biomod2 and 6 different algorithms: a combination of regression (Boosted
+Regression Trees, Multiple Adaptive Regression Splines, Generalized
+Linear Models, and Generalized Additive Models) and machine-learning methods 
+(Random Forest, Maxent) commonly used in an SDM context. 
+
+Model were combined into a weighted average based on area under the curve
+(AUC) of the receiver operating characteristic (ROC), so that better-performing 
+models contributed more to the final ensemble, with the threshold for inclusion 
+greater or equal to the median AUC calculated from all the models.
+
+Model evaluation: We used a withheld dataset consisting of GPS data that were 
+not used in model calibration. We used the R package “pROC” (Robin et al., 2011)
+to calculate AUC and “ecospat” (Di Cola et al., 2017) to calculate the
+Boyce index. 
+
+
+Additionally, for only the best-performing (most predictive) model, 
+we also assessed relative contribution of each environmental covariate 
+to better understand what factors were contributing to modeled lynx distribution
+(Hällfors et al., 2016). We evaluated the importance of covariates by
+permuting a single variable, generating model predictions, and calculating 
+the correlation between these permuted predictions and the
+original model predictions; if a variable was important, model predictions would be altered, and correlation between predictions would be low when the variable was permuted (Thuiller et al., 2009). 
+Since we used an ensemble of six modeling techniques, each variable was
+given six measures of importance, which we combined in a single
+boxplot for illustrative purposes.
+
+
+### Define the data and models to use in biomod2
+
+- GLM: Generalized Linear Models
+- GAM: Generalized Additive Models
+- GBM: Boosted Regression Trees 
+- MARS: Multiple Adaptive Regression Splines 
+- RF: Random Forest
+- MAXENT.Phillips: Maxent
+
+- + ANN: Artificial Neural Network
+
+## Run models
+
+```{r}
+## Formating data
+# Transform points into presence (1) - absence (0) and divide into train and test sets
+wolf_dat_train <- all_wolf_points %>% 
+  filter(fold != 5) %>% 
+  mutate(pres_bg = case_when(
+    data == "presences" ~ 1,
+    data == "background" ~ 0)) %>% 
+  dplyr::select(pres_bg) %>% 
+  as_Spatial()
+wolf_dat_train
+table(wolf_dat_train$pres_bg)
+#     0     1 
+# 30661  3073 
+nrow(wolf_dat_train) # 33734
+
+wolf_dat_test <- all_wolf_points %>% 
+  filter(fold == 5) %>% 
+  mutate(pres_bg = case_when(
+    data == "presences" ~ 1,
+    data == "background" ~ 0)) %>% 
+  dplyr::select(pres_bg) %>% 
+  as_Spatial()
+
+wolf_dat_test
+table(wolf_dat_test$pres_bg)
+#    0    1 
+# 7665  768 
+nrow(wolf_dat_test) # 8433
+
+
+## Extract environmental covariates
+head(all_wolf_points)
+
+my_covariates_train <- all_wolf_points %>%
+  filter(fold != 5) %>% 
+  as.data.frame() %>% 
+  dplyr::select(CLC2012:Dist_roads) %>% 
+  mutate(CLC2012 = as.factor(as.character(CLC2012)))
+head(my_covariates_train)
+str(my_covariates_train) # 33734 obs. of  5 variables
+
+my_covariates_test <- all_wolf_points %>%
+  filter(fold == 5) %>% 
+  as.data.frame() %>% 
+  dplyr::select(CLC2012:Dist_roads) %>% 
+  mutate(CLC2012 = as.factor(as.character(CLC2012)))
+head(my_covariates_test)
+str(my_covariates_test) #8433 obs. of  5 variables
+
+
+wolf_mod_dat <- BIOMOD_FormatingData(resp.var = wolf_dat_train,
+                                     # expl.var = env_germany,
+                                     expl.var = my_covariates_train,
+                                     #eval.resp.var = ,
+                                     #PA.strategy = "random",
+                                     #PA.nb.rep = 0, # common practice to resample!
+                                     #PA.nb.absences = 0,
+                                     resp.name = "Wolf")
+wolf_mod_dat
+                                    
+                                    
+## Define models
+# For maxent, we need to add some options to the models. 
+# Important, the directory where to find java/maxent. 
+myBiomodOptions <- BIOMOD_ModelingOptions(
+  MAXENT.Phillips = list( path_to_maxent.jar = "C:/TEMP/maxent.jar",
+                          maximumiterations = 5000,
+                          responsecurves=TRUE,
+                          jacknife=TRUE,
+                          replicates=3,
+                          visible = FALSE,
+                          directory="/output/test",
+                          linear = TRUE, 
+                          quadratic = TRUE,
+                          product = TRUE,
+                          threshold = FALSE,
+                          hinge = TRUE,
+                          lq2lqptthreshold = 80,
+                          l2lqthreshold = 10,
+                          hingethreshold = 15,
+                          beta_threshold = -1,
+                          beta_categorical = -1,
+                          beta_lqp = -1,
+                          beta_hinge = -1,
+                          defaultprevalence = 0.5))
+
+wolf_mod_out <- BIOMOD_Modeling(data = wolf_mod_dat,
+                            models =c('GLM','GAM','GBM', 'MARS', 'ANN','RF','MAXENT.Phillips'),
+                            SaveObj = TRUE,
+                           models.options = myBiomodOptions,
+                           NbRunEval = 10,
+                           DataSplit = 80, # common practice to validate: 80 train, 20 test
+                           models.eval.meth = c('KAPPA','TSS','ROC'),
+                           VarImport = 10)
+
+wolf_mod_out
+str(wolf_mod_out)
+wolf_mod_out@models.computed
+# saveRDS(wolf_mod_out, paste0(results_wd, "/ensemble_results/all_models_wolf_train80.rds"))
+# wolf_mod_out <- readRDS(paste0(results_wd, "/ensemble_results/all_models_wolf_train80.rds"))
+
+# get all models evaluation
+wolf_ModelEval <- get_evaluations(wolf_mod_out)
+wolf_ModelEval
+# print the dimnames of this object
+dimnames(wolf_ModelEval)
+
+# get the AUC scores 
+(AUC_table <- wolf_ModelEval["ROC","Testing.data",,,])
+rowSums(AUC_table[,1:10])
+
+# get the TSS scores 
+(TSS_table <- wolf_ModelEval["TSS","Testing.data",,,])
+rowSums(TSS_table[,1:10])
+
+
+# write.csv(AUC_table, paste0(results_wd, "/ensemble_results/all_models_AUCTable.csv"))
+# write.csv(TSS_table, paste0(results_wd, "/ensemble_results/all_models_TSSTable.csv"))
+
+
+```
+
+## get variable importance
+For the machine learning algorithms ANN and GBM, the AIC approach is not applicable because there is no model log-likelihood information available. Therefore, we have included the variable importance function that is implemented in the biomod2 package. This function uses a machine-learning approach once the models are trained to randomize one of the variables in each permutation and calculate a correlation score between the standard prediction and the new prediction. This score is considered to give an estimation of the variable importance in the model. The higher the value, the more importance the predictor variable has on the model. A value of 0 assumes no influence of that predictor. Note that this method does not account for interactions between variables and should be considered more as an information tool for each model independently.
+```{r}
+# print variable importances
+wolf_VarImpor <- get_variables_importance(wolf_mod_out)
+wolf_VarImpor
+# Variable importance of the full model
+VarImpor_table <- wolf_VarImpor[,,"Full","AllData"]
+VarImpor_table
+
+## Average variable importance in the 10 model replicates
+# extract the matrices to a list
+wolf_VarImpor_list <- list()
+for (i in 1:10){
+  wolf_VarImpor_list[[i]] <- as.data.frame(wolf_VarImpor[,,i,])
+}
+
+for (i in 1:length(wolf_VarImpor_list)){
+  wolf_VarImpor_list[[i]]$RUN <- paste0("Run_", i)
+}
+
+wolf_VarImport_allmodels <- do.call(rbind, wolf_VarImpor_list)
+# write.csv(wolf_VarImport_allmodels, paste0(results_wd, "/ensemble_results/all_models_VariableImportance.csv"))
+
+
+
+##Varible contributions for Maxent, not possible this method for other models
+forSetup <- read.csv(file = paste("./Wolf/models/1617188603/Wolf_AllData_Full_MAXENT.Phillips_outputs/maxentResults.csv", 
+                                  sep = ""), header = T)#Choose the appropriate model folder with the seed of the analysis you want
+variableContributions <- matrix(data = NA, nrow = length(forSetup[, grep('.contribution', names(forSetup))]), ncol = 10);
+rownames(variableContributions) <- names(forSetup[, grep('.contribution', names(forSetup))])
+colnames(variableContributions) <- c("Run1", "Run2", "Run3", "Run4", "Run5", "Run6", "Run7", "Run8", "Run9", "Run10")
+variablePermutationImportance <- matrix(data = NA, nrow = length(forSetup[, grep('.permutation.importance', names(forSetup))]), ncol = 10);
+colnames(variablePermutationImportance) <- c("Run1", "Run2", "Run3", "Run4", "Run5", "Run6", "Run7", "Run8", "Run9", "Run10")
+count <- 1;
+while (count <= 10){
+  temporary <- read.csv(file = paste("./Wolf/models/1617188603/Wolf_AllData_RUN", count, "_MAXENT.Phillips_outputs/maxentResults.csv", sep = ""), header = T);
+  variableContributions[,count] <- unlist(unname(temporary[, grep('.contribution', names(temporary))]))
+  variablePermutationImportance[,count] <- unlist(unname(temporary[, grep('.permutation.importance', names(temporary))]))
+  count <- count + 1;
+}
+write.csv(variableContributions, paste0(results_wd, "/ensemble_results/Maxent_VariableContributions.csv"))
+write.csv(variablePermutationImportance, paste0(results_wd, "/ensemble_results/Maxent_VariablePermutationImportance.csv"))
+
+
+
+# response curves
+## Variable response curves
+response.plot2(models = BIOMOD_LoadModels(wolf_mod_out, models='MAXENT.Phillips'),
+               Data = get_formal_data(wolf_mod_out,'expl.var'),
+               show.variables= get_formal_data(wolf_mod_out,'expl.var.names'),
+               do.bivariate = FALSE,
+               fixed.var.metric = 'mean',
+               col = brewer.pal(10, "Spectral"),
+               legend = TRUE,
+               data_species = get_formal_data(wolf_mod_out,'resp.var'))
+```
+
+
+## Make ensemble
+```{r}
+### Building ensemble-models
+# All models with AUC > 0.7
+wolf_ensemblemod <- BIOMOD_EnsembleModeling(
+  modeling.output = wolf_mod_out,
+  chosen.models = 'all',
+  em.by='all', 
+  eval.metric = c('ROC'),
+  eval.metric.quality.threshold = c(0.7), # model above 0.7 AUC values
+  prob.mean = T,
+  prob.cv = T,
+  prob.ci = T,
+  prob.ci.alpha = 0.05,
+  prob.median = T,
+  committee.averaging = T,
+  prob.mean.weight = T,
+  prob.mean.weight.decay = 'proportional' )
+
+wolf_ensemblemod
+# saveRDS(wolf_ensemblemod, paste0(results_wd, "/ensemble_results/ensemble_wolf.rds"))
+
+# get evaluation scores
+get_evaluations(wolf_ensemblemod)
+```
+
+
+## Project models
+```{r}
+### Project individual models
+wolf_BiomodProj <- BIOMOD_Projection(
+  modeling.output = wolf_mod_out,
+  new.env = env_germany,
+  proj.name = 'ind_models',
+  selected.models = 'all',
+  compress = 'gzip',
+  build.clamping.mask = F,
+  output.format = '.grd', 
+  do.stack=T)
+
+wolf_BiomodProj
+# saveRDS(wolf_BiomodProj, paste0(results_wd, "/ensemble_results/all_models_biomod_projection.rds"))
+names(wolf_BiomodProj)
+
+# make some plots sub-selected by str.grep argument
+plot(wolf_BiomodProj, str.grep ='MARS')
+
+# to make custom plots, get the projected map
+wolf_indmodelProj <- get_predictions(wolf_BiomodProj)
+wolf_indmodelProj
+wolf_Result <- calc(wolf_indmodelProj,fun = median); #Choose whatever descriptive statistic you'd like
+plot(wolf_Result)
+# writeRaster(wolf_Result, filename = paste0(results_wd, "/ensemble_results/all_models_median_projection_3035.tif"), 
+#             overwrite = T);
+
+## Project ensemble-model
+wolf_BiomodEF <- BIOMOD_EnsembleForecasting(EM.output = wolf_ensemblemod,
+                            projection.output = wolf_BiomodProj,
+                            selected.models = 'all',
+                            compress = 'gzip')
+wolf_BiomodEF
+# saveRDS(wolf_BiomodEF, paste0(results_wd, "/ensemble_results/ensemble_forcasting.rds"))
+# wolf_BiomodEF <- readRDS(paste0(results_wd, "/ensemble_results/ensemble_forcasting.rds"))
+
+wolf_projEnsemble <- get_predictions(wolf_BiomodEF)
+names(wolf_projEnsemble)
+wolf_EnsembleResult <- wolf_projEnsemble[[1]] #This is the mean model ensemble across all models
+wolf_EnsembleResult_wm <- wolf_projEnsemble$Wolf_EMwmeanByROC_mergedAlgo_mergedRun_mergedData # weighted mean model based on AUC
+plot(wolf_EnsembleResult)
+plot(wolf_EnsembleResult_wm)
+
+# writeRaster(wolf_EnsembleResult, filename = paste0(results_wd, "/ensemble_results/ensemble_mean_projection_3035.tif"),
+#             overwrite = T)
+# writeRaster(wolf_EnsembleResult_wm, 
+#             filename = paste0(results_wd, "/ensemble_results/ensemble_weightedmean_projection_3035.tif"),
+#             overwrite = T)
+```
+
+
+## Plot individual models
+```{r}
+wolf_BiomodProj <- readRDS(paste0(results_wd, "/ensemble_results/all_models_biomod_projection.rds"))
+wolf_projections <- stack("./Wolf/proj_ind_models/proj_ind_models_Wolf.grd")
+
+# plot fancy map for MAXENT
+wolf_Maxent_pred <- wolf_projections$Wolf_AllData_Full_MAXENT.Phillips
+# writeRaster(wolf_Maxent_pred, filename = paste0(results_wd, "/ensemble_results/all_models_Maxent_projection_3035.tif"),
+#             overwrite = T)
+
+
+# convert to a df for plotting in two steps,
+# First, to a SpatialPointsDataFrame
+wolf_maxent_pts <- rasterToPoints(wolf_Maxent_pred, spatial = TRUE)
+# Then to a 'conventional' dataframe
+wolf_maxent_df  <- data.frame(wolf_maxent_pts)
+wolf_maxent_df$maxent <- wolf_maxent_df$Wolf_AllData_Full_MAXENT.Phillips/1000
+
+wolf_maxent_map <- ggplot(data = wolf_maxent_df, aes(y=y, x=x)) +
+  geom_raster(aes(fill=maxent)) +
+  # geom_point(data=sites, aes(x=x, y=y), color=”white”, size=3, shape=4) +
+  theme_bw() +
+  coord_equal() +
+  scale_fill_viridis(limits = c(0, 1),
+                       "Maxent \nHabitat Suitability") +
+  theme(axis.title.x = element_text(size=16),
+        axis.title.y = element_text(size=16, angle=90),
+        axis.text.x = element_text(size=14),
+        axis.text.y = element_text(size=14),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.position = "right",
+        legend.key = element_blank())
+
+ggsave(plot = wolf_maxent_map, filename = paste0(plots_wd, "/Plot_MAP_Wolf_HabitatSuitability_Maxent.tif"),
+       device ='tiff', 
+       dpi = 700, height = 8, width = 6)
+
+
+# plot fancy map for Random Forest
+wolf_RF_pred <- wolf_projections$Wolf_AllData_Full_RF
+# writeRaster(wolf_RF_pred, filename = paste0(results_wd, "/ensemble_results/all_models_RF_projection_3035.tif"))
+
+# convert to a df for plotting in two steps,
+# First, to a SpatialPointsDataFrame
+wolf_RF_pts <- rasterToPoints(wolf_RF_pred, spatial = TRUE)
+# Then to a 'conventional' dataframe
+wolf_RF_df  <- data.frame(wolf_RF_pts)
+wolf_RF_df$RF <- wolf_RF_df$Wolf_AllData_Full_RF/1000
+
+wolf_RF_map <- ggplot(data = wolf_RF_df, aes(y=y, x=x)) +
+  geom_raster(aes(fill=RF)) +
+  # geom_point(data=sites, aes(x=x, y=y), color=”white”, size=3, shape=4) +
+  theme_bw() +
+  coord_equal() +
+  scale_fill_viridis(limits = c(0, 1),
+                       "RF \nHabitat Suitability") +
+  theme(axis.title.x = element_text(size=16),
+        axis.title.y = element_text(size=16, angle=90),
+        axis.text.x = element_text(size=14),
+        axis.text.y = element_text(size=14),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.position = "right",
+        legend.key = element_blank())
+
+ggsave(plot = wolf_RF_map, filename = paste0(plots_wd, "/Plot_MAP_Wolf_HabitatSuitability_RF.tif"),
+       device ='tiff', 
+       dpi = 700, height = 8, width = 6)
+
+
+```
+
+
+## Plot ensemble
+```{r}
+wolf_EnsembleResult_wm <- raster(paste0(results_wd, "/ensemble_results/ensemble_weightedmean_projection_3035.tif"))
+
+# plot fancy map
+# convert to a df for plotting in two steps,
+# First, to a SpatialPointsDataFrame
+wolf_EF_pts <- rasterToPoints(wolf_EnsembleResult_wm, spatial = TRUE)
+# Then to a 'conventional' dataframe
+wolf_EF_df  <- data.frame(wolf_EF_pts)
+wolf_EF_df$HS <- wolf_EF_df$ensemble_weightedmean_projection_3035/1000
+
+wolf_EF_map <- ggplot(data = wolf_EF_df, aes(y=y, x=x)) +
+  geom_raster(aes(fill=HS)) +
+  # geom_point(data=sites, aes(x=x, y=y), color=”white”, size=3, shape=4) +
+  theme_bw() +
+  coord_equal() +
+  scale_fill_viridis(limits = c(0, 1),
+                       "Habitat Suitability") +
+  theme(axis.title.x = element_text(size=16),
+        axis.title.y = element_text(size=16, angle=90),
+        axis.text.x = element_text(size=14),
+        axis.text.y = element_text(size=14),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.position = "right",
+        legend.key = element_blank())
+
+ggsave(plot = wolf_EF_map, filename = paste0(plots_wd, "/Plot_MAP_Wolf_HabitatSuitability_Ensemble.tif"),
+       device ='tiff', 
+       dpi = 700, height = 8, width = 6)
+
+
+
+
+```
+
+
+
+
+## Calculate MESS for wolf predictions
+```{r}
+# Extract the environmental values in wolf presences
+ref_env <- wolf_pres %>% 
+  as.data.frame() %>% 
+  dplyr::select(CLC2012:Dist_roads)
+
+# create the mess using full germany rasters
+mess_wolf <- mess(env_germany, ref_env, full = TRUE)
+# writeRaster(mess_wolf, paste0(results_wd, "/ensemble_results/MESS_all_wolf_presences_3035.tif"), 
+            # overwrite = T);
+plot(mess_wolf)
+
+
+# plot fancy map
+# convert to a df for plotting in two steps,
+# First, to a SpatialPointsDataFrame
+mess_wolf_pts <- rasterToPoints(mess_wolf$mess, spatial = TRUE)
+# Then to a 'conventional' dataframe
+mess_wolf_df  <- data.frame(mess_wolf_pts)
+
+# Reclassify values for mapping to min of -100
+mess_wolf_df <- mess_wolf_df %>% 
+  mutate(mess_reclass = ifelse(mess < -100, -100, mess))
+
+#Now make the map
+mess_wolf_map <- ggplot(data = mess_wolf_df, aes(y=y, x=x)) +
+  geom_raster(aes(fill=mess_reclass)) +
+  # geom_point(data=sites, aes(x=x, y=y), color=”white”, size=3, shape=4) +
+  theme_bw() +
+  coord_equal() +
+  scale_fill_gradient2(low = muted("red"), 
+                       mid = "grey90",
+                       high = muted("green"),
+                       midpoint = 0, 
+                       limits = c(-100, 100),
+                       "MESS") +
+  theme(axis.title.x = element_text(size=16),
+        axis.title.y = element_text(size=16, angle=90),
+        axis.text.x = element_text(size=14),
+        axis.text.y = element_text(size=14),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.position = "right",
+        legend.key = element_blank())
+
+ggsave(plot = mess_wolf_map, filename = paste0(plots_wd, "/Plot_MAP_MESS_all_wolf_presences.tif"),
+       device ='tiff', 
+       dpi = 700, height = 8, width = 6)
+```
+
+
+
+
+
+
+##-------------------------------------------##
+
+
+
+## Project model in binary map
+```{r}
+?BIOMOD_Projection
+# Random background
+gc()
+predictors.int<- stack(predictors.int)
+
+tol.spBiomodProj <- BIOMOD_Projection(modeling.output = test,
+                                      new.env = predictors.int,
+                                      proj.name = 'current',
+                                      selected.models = 'all',
+                                      binary.meth = 'ROC',
+                                      compress = 'xz',
+                                      built.clamping.mask = F,
+                                      output.format = '.grd',
+                                      keep.in.memory = FALSE)
+```
+
+
+
+
+
