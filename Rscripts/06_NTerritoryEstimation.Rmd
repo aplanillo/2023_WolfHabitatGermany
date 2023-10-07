@@ -1,0 +1,325 @@
+---
+title: "5_N_territory_estimation"
+author: "Aimara Planillo"
+date: "15/04/2021"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+# libraries and functions
+source("./R/source_file.R")
+source("./R/source_wd.R")
+
+workDir <- getwd()
+
+dataproc_wd <- paste0(workDir, "/output/data_proc")
+geoproc_wd <- paste0(workDir, "/output/geo_proc")
+results_wd <- paste0(workDir, "/output/results")
+```
+
+
+# Territory estimation in Germany
+
+We are going to create a map at 10 km resolution to estimate the total number of 
+wolf territories that potentially could happen in Germany (max number)  
+
+We need to rescale the 100 m resolution predictions to 10 km, using Eurogrid as 
+a template for the grid cells at 10 km resolution.
+
+we are going to use the mean value of the new cells and the sd to create a binary map
+with the potential territories
+
+### Load data
+```{r}
+# ensemble 100 m
+wolf_EnsembleResult_wm <- raster(paste0(results_wd, "/ensemble_global/ensemble_samebgpres_weightedmean_projection_3035.tif"))
+
+# template Eurogrid
+eurogrid_10km <- st_read(paste0(geoproc_wd, "/DE_10km_final_Union/DE_10km_final_Union1.shp")) %>% 
+  st_transform(crs = 3035)
+plot(st_geometry(eurogrid_10km))
+
+
+# Environmental values for germany
+env_germany <- stack(paste0(geoproc_wd, "/stack_env_rasters_germany_3035_AP.tif"))
+names(env_germany) <- c("CLC2012", "Pop_den", "HFP", "Dist_settl", "Dist_roads") 
+
+# Water mask to remove territories on water from env. layers
+watermask_10km <- raster(paste0(geoproc_wd, "/watermask_10km_3035.tif"))
+
+# load germany border
+germany_3035 <- read_sf(paste0(geoproc_wd, "/germany_3035.gpkg"), crs = 3035) 
+
+# territory data
+# load all GPS data for resident adults
+terr_sf <- st_read(paste0(dataproc_wd, "/territory_points_3035.gpkg")) %>% 
+  st_transform(crs = 3035)
+terr_sf
+```
+
+
+## Resample
+
+We are going to use the Eurogrid as a template for the 10 km grid cells
+We also build two models at the 10 km resolution:
+- Mean value
+- Sd value
+
+```{r}
+# create new raster from grid at same resolution than predictions
+Eurogrid_raster_100m <- raster(extent(eurogrid_10km), res = 100, crs = crs(as(eurogrid_10km,"Spatial")))
+values(Eurogrid_raster_100m) <- 1
+
+# give values of predictions to new raster
+resampled_raster_100m <- resample(x = wolf_EnsembleResult_wm, 
+                                  y = Eurogrid_raster_100m, 
+                                  method="bilinear" )
+
+# get mean values at 10km resolution
+pred_mean_10km <- aggregate(resampled_raster_100m, fact = 100, fun = mean, na.rm = TRUE)
+# writeRaster(pred_mean_10km, paste0(results_wd, "/10km_res/ensemble_mean_10km_3035.tif"), overwrite = TRUE)
+
+# get sd values at 10km resolution
+pred_sd_10km <- aggregate(resampled_raster_100m, fact = 100, fun = sd, na.rm = TRUE)
+# writeRaster(pred_sd_10km, paste0(results_wd, "/10km_res/ensemble_sd_10km_3035.tif"), overwrite = TRUE)
+
+## Extract data for territory centroids
+terr_mean <- raster::extract(pred_mean_10km, as_Spatial(terr_sf), sp = TRUE)
+terr_sd <- raster::extract(pred_sd_10km, terr_mean, sp = TRUE)
+names(terr_sd)[6] <- "ensemble_mean"
+names(terr_sd)[7] <- "ensemble_sd"
+
+terr_ensemble_values_10km <- st_as_sf(terr_sd)
+# st_write(terr_ensemble_values_10km, paste0(results_wd, "/10km_res/terr_ensemble_values_10km_3035.gpkg"),
+#          append=FALSE)
+
+plot(terr_ensemble_values_10km)
+
+# Create data frame to explore the values
+terr_values_df <- as.data.frame(terr_ensemble_values_10km)
+
+hs_terr_plot <- ggplot(terr_values_df, aes(x = ensemble_mean, y = ensemble_sd)) +
+  geom_smooth() +
+  geom_point() +
+  ggtitle("Mean and sd of Habitat suitability values \nin wolf territories") +
+  theme(
+    panel.background = element_blank(),
+    axis.line = element_line("black"), 
+    plot.title = element_text(color = "black", size = 16)
+  )
+```
+
+# Create binary map
+
+## Mean - sd
+
+```{r}
+# count each territory only once for the average calculations. Remove duplicated entries
+unique_terr <- terr_data %>%
+  dplyr::select(Territorium, Tkurz, ensemble_mean, ensemble_sd) %>% 
+  distinct(.keep_all = TRUE) %>%
+  as.data.frame()
+
+mean_hs <- mean(unique_terr$ensemble_mean)
+mean_hs
+sd_hs <- sd(unique_terr$ensemble_mean)
+sd_hs 
+
+min_hs <- min(unique_terr$ensemble_mean)
+max_hs <- max(unique_terr$ensemble_mean)
+min_hs 
+max_hs 
+
+# Binary mean - sd
+my_threshold <- mean_hs - sd_hs
+
+binary_tmp <- pred_mean_10km
+binary_tmp[binary_tmp < my_threshold] <- 0
+binary_tmp[binary_tmp >= my_threshold] <- 1
+
+binary_1 <- binary_tmp
+
+
+# Binary low 95% CI
+my_threshold <- mean_hs - 1.96*sd_hs 
+
+binary_tmp <- pred_mean_10km
+binary_tmp[binary_tmp < my_threshold] <- 0
+binary_tmp[binary_tmp >= my_threshold] <- 1
+
+binary_2 <- binary_tmp
+
+
+plot(binary_1)
+plot(binary_2)
+```
+
+
+# Create binary map
+
+## TSS
+```{r}
+# get evaluation scores and maxTSS threshold
+scores_all <- get_evaluations(wolf_ensemblemod)
+threshold <- scores_all$Wolf.2_EMwmeanByROC_mergedAlgo_mergedRun_mergedData["TSS", "Cutoff"]
+threshold
+
+# Binary maxTSS threshold
+
+binary_tmp <- pred_mean_10km
+binary_tmp[binary_tmp < threshold] <- 0
+binary_tmp[binary_tmp >= threshold] <- 1
+
+binary_maxTSS <- binary_tmp
+
+plot(binary_maxTSS)
+```
+
+
+# Territory count
+
+## Remove cell that are alone (not territories) and water
+```{r}
+## Binary 1: Mean - sd 
+my_focal_map_terr <- binary_1 * watermask_10km
+plot(my_focal_map_terr)
+
+## compute focal mean to identfy all raster cells having a neighbour
+my_focal_map_terr_sum <- raster::focal(x = my_focal_map_terr, 
+                                  w = matrix(c(1, 1, 1,
+                                               1, 1, 1,
+                                               1, 1, 1),
+                                             nrow=3, 
+                                             ncol=3),  
+                                  fun = sum, 
+                                  na.rm = TRUE, 
+                                  pad = TRUE, 
+                                  padValue = 1
+                                  )
+
+final_map_terr <- my_focal_map_terr_sum
+final_map_terr[] <- 0
+final_map_terr[my_focal_map_terr_sum > 1 & my_focal_map_terr == 1 ] <- 1
+plot(final_map_terr)
+
+# writeRaster(final_map_terr, 
+#             paste0(results_wd, "/10km_res/ensemble_binary_mean-sd_watermask_10km_3035.tif"))
+
+
+plot(mask(final_map_terr, germany_3035))
+plot(mcps_plot, add =T, alpha = 0.5)
+# Number of territories
+floor(sum(values(final_map_terr))/2)
+
+##Binary 2: low 95% CI
+my_focal_map_terr <- binary_2 * watermask_10km
+plot(my_focal_map_terr)
+
+## compute focal mean to identfy all raster cells having a neighbour
+my_focal_map_terr_sum <- raster::focal(x = my_focal_map_terr, 
+                                  w = matrix(c(1, 1, 1,
+                                               1, 1, 1,
+                                               1, 1, 1),
+                                             nrow=3, 
+                                             ncol=3),  
+                                  fun = sum, 
+                                  na.rm = TRUE, 
+                                  pad = TRUE, 
+                                  padValue = 1
+                                  )
+
+final_map_terr <- my_focal_map_terr_sum
+final_map_terr[] <- 0
+final_map_terr[my_focal_map_terr_sum > 1 & my_focal_map_terr == 1 ] <- 1
+plot(final_map_terr)
+
+# writeRaster(final_map_terr, 
+#             paste0(results_wd, "/10km_res/ensemble_binary_low95CI_watermask_10km_3035.tif"))
+
+
+final_map_terr_plot <- mask(final_map_terr, germany_3035)
+
+plot(mask(final_map_terr, germany_3035))
+plot(mcps_plot, add =T, alpha = 0.5)
+# Number of territories
+floor(sum(values(final_map_terr))/2)
+```
+
+
+
+
+# Analysis of Reproduction in stablished territories
+```{r}
+## load data
+terr_ensemble_values_10km <- st_read(paste0(results_wd,
+                                            "/10km_res/terr_ensemble_values_10km_3035.gpkg")) %>% 
+  st_transform(crs = 3035)
+
+plot(terr_ensemble_values_10km)
+
+summary(terr_ensemble_values_10km)
+
+
+# Create data to plot histograms of reproductive events 
+terr_values_df_rep <- terr_ensemble_values_10km %>% 
+  as.data.frame() %>% 
+  mutate(reproduction = case_when(
+    Welpen > 0 ~ 1, 
+    Welpen == 0 ~ 0)) %>%
+  group_by(Territorium) %>% 
+  mutate(terr_age = row_number()) %>% 
+  ungroup() %>% 
+  as.data.frame()
+
+
+head(terr_values_df_rep, 30)  
+terr_values_df_rep[terr_values_df_rep$Welpen == 13,]
+
+# Model with all effects
+library(lme4)
+
+mod_rep <- glmer(reproduction ~ scale(ensemble_mean) + scale(ensemble_sd) + scale(terr_age) + (1|Territorium), 
+                  family = "binomial", 
+                  data = terr_values_df_rep)
+summary(mod_rep)
+
+plot(ggeffect(mod_rep, terms = "ensemble_mean"))
+plot(ggeffect(mod_rep, terms = "ensemble_sd"))
+plot(ggeffect(mod_rep, terms = "terr_age"))
+saveRDS(mod_rep, paste0(results_wd, "/10km_res/model_reproduction_terr_habitatsuitability.rds"))
+
+
+# Model with mean 
+mod_mean <- glmer(reproduction ~ scale(ensemble_mean) + scale(terr_age) + (1|Territorium), 
+                  family = "binomial", 
+                  data = terr_values_df_rep, 
+                  glmerControl(optimizer = "bobyqa"))
+summary(mod_mean)
+plot(ggeffect(mod_mean, terms = "ensemble_mean"))
+
+# Model with sd 
+mod_sd <- glmer(reproduction ~ scale(ensemble_sd) + scale(terr_age) + (1|Territorium), 
+                  family = "binomial", 
+                  data = terr_values_df_rep)
+summary(mod_sd)
+plot(ggeffect(mod_sd, terms = "ensemble_sd"))
+
+
+## With number of offspring
+mod_repnumber <- glmer(Welpen ~ scale(ensemble_mean) + scale(ensemble_sd) + scale(terr_age) + (1|Territorium), 
+                  family = "poisson", 
+                  data = terr_values_df_rep)
+summary(mod_repnumber)
+
+plot(ggeffect(mod_repnumber, terms = "ensemble_sd"))
+plot(ggeffect(mod_repnumber, terms = "ensemble_mean"))
+
+```
+
