@@ -1614,3 +1614,4 @@ pred_hs <- pred_hs[!is.na(pred_hs)]
 boyce_test_comb_ensemble <- ecospat.boyce(fit = pred_hs, obs = pres_vector, nclass = 0)
 cor(boyce_test_comb_ensemble$F.ratio, boyce_test_comb_ensemble$HS, method = "spearman")
 ```
+
