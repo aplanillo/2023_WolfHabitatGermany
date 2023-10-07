@@ -1,0 +1,975 @@
+---
+title: "RegionalModels"
+author: "Aimara Planillo"
+date: "4/23/2021"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Regional ensemble models
+
+```{r}
+source("./R/source_file.R")
+
+workDir <- getwd()
+
+dataproc_wd <- paste0(workDir, "/output/data_proc")
+geoproc_wd <- paste0(workDir, "/output/geo_proc")
+results_wd <- paste0(workDir, "/output/regional_ensemble")
+```
+
+
+## load data
+
+```{r}
+# telemetry data
+gps_21ter2 <- st_read(paste0(dataproc_wd, "/gps_adults_21territories_allpoints_3035.gpkg")) %>% 
+  st_transform(crs = 3035)
+
+# mcp
+mcp95_all_sf <- st_read(paste0(dataproc_wd, "/gps_MCP95_adults_allpoints_3035.gpkg")) %>% 
+  st_transform(crs = 3035)
+
+plot(st_geometry(mcp95_all_sf))
+
+# wolf points for model
+all_wolf_points <- st_read(paste0(dataproc_wd, "/all_wolf_points_ensemble_3035.gpkg")) %>% 
+   st_transform(crs = 3035)
+all_wolf_points$CLC2012[all_wolf_points$CLC2012 == 103] <- 102
+
+str(all_wolf_points)
+table(all_wolf_points$type, all_wolf_points$data)
+```
+
+# extract regions
+
+we selected them previously manually, here we select the mcp and make a buffer around them to use as background data
+```{r}
+# give year to telemetry and mcp
+gps_21ter2$year <- year(gps_21ter2$timestamp)
+
+# Define regions
+gps_df <- gps_21ter2 %>% 
+  as.data.frame() %>% 
+  dplyr::select(id,year)
+table(gps_df)
+
+# Region 1 = FT4, FT7, MT4, MT2, FT9, FT3, MT3, MT5, FT8, FT2
+region1_id <- c("FT4", "FT7", "MT4", "MT2", "FT9", "FT3", "MT3", "MT5", "FT8", "FT2")
+gps_df %>% 
+  dplyr::filter(id %in% region1_id) %>% 
+  group_by(year, id) %>% 
+  summarise(n = n()) # from 2009 to 2015
+
+# Region 2 = FT5, FT6, ID3, ID1, ID1p
+region2_id <- c("FT5", "FT6", "ID3", "ID1", "ID1p")
+gps_df %>% 
+  dplyr::filter(id %in% region2_id) %>% 
+  group_by(year, id) %>% 
+  summarise(n = n()) # 2011 - 2018
+
+# Region 3 = WR1, WR6, FT10, WF3
+region3_id <- c("WR1", "WR6", "FT10", "WF3")
+gps_df %>% 
+  dplyr::filter(id %in% region3_id) %>% 
+  group_by(year, id) %>% 
+  summarise(n = n()) # all data from 2015 to 2018 
+
+
+# get presences and bg points
+wolf_presences <- all_wolf_points %>% 
+  dplyr::filter(data == "presences")
+
+wolf_bg <- all_wolf_points %>% 
+  dplyr::filter(data == "background")
+
+### extract region 1 data
+# MCP
+region1_mcp <- mcp95_all_sf %>%
+  dplyr::filter(id %in% region1_id) %>% 
+  st_cast("POLYGON")
+
+
+# Presences within those mcps
+region1_pres <- st_join(wolf_presences, region1_mcp, join = st_intersects) %>% 
+  dplyr::filter(!is.na(id)) %>% 
+  distinct(.keep_all = TRUE) %>% # remove duplicated coordinates due to overlapping mcps
+  dplyr::select(-c(id, area, color))
+
+# create buffer 50 km and dissolve
+region1_buffer <- st_buffer(region1_mcp, 50000) %>% 
+  st_union() %>% 
+  st_sf() %>% 
+  mutate(region = "region1") 
+
+# extract bg points
+n_pres <- nrow(region1_pres)
+region1_bg <- st_join(wolf_bg, region1_buffer, join = st_within) %>% 
+  sample_n(n_pres) %>%  # sample random rows number = n_pres
+  dplyr::filter(!is.na(region)) %>% # remove points out of the polygon
+  dplyr::select(-region)
+
+plot(region1_buffer)
+plot(st_geometry(region1_mcp), add = TRUE, col = "blue")
+plot(st_geometry(region1_pres), add = TRUE, col = "green")
+plot(st_geometry(region1_bg), add = TRUE, col = "red")
+
+# merge data for analysis
+region1_pres
+region1_bg
+region1_allpoints <- rbind(region1_pres, region1_bg)
+
+```
+
+## Run model region 1
+
+```{r}
+## Formating data
+# Transform points into presence (1) - absence (0) and divide into train and test sets
+region1_train <- region1_allpoints %>% 
+  filter(fold != 5) %>% 
+  mutate(pres_bg = case_when(
+    data == "presences" ~ 1,
+    data == "background" ~ 0)) %>% 
+  dplyr::select(pres_bg) %>% 
+  as_Spatial()
+region1_train
+table(region1_train$pres_bg)
+
+nrow(region1_train) 
+
+region1_test <- region1_allpoints %>% 
+  filter(fold == 5) %>% 
+  mutate(pres_bg = case_when(
+    data == "presences" ~ 1,
+    data == "background" ~ 0)) %>% 
+  dplyr::select(pres_bg) %>% 
+  as_Spatial()
+
+region1_test
+table(region1_test$pres_bg)
+
+nrow(region1_test) 
+
+
+## Extract environmental covariates
+head(region1_allpoints)
+
+region1_covariates_train <- region1_allpoints %>%
+  filter(fold != 5) %>% 
+  as.data.frame() %>% 
+  dplyr::select(CLC2012:Dist_roads) %>% 
+  mutate(CLC2012 = as.factor(as.character(CLC2012)))
+head(region1_covariates_train)
+str(region1_covariates_train) 
+
+region1_covariates_test <- region1_allpoints %>%
+  filter(fold == 5) %>% 
+  as.data.frame() %>% 
+  dplyr::select(CLC2012:Dist_roads) %>% 
+  mutate(CLC2012 = as.factor(as.character(CLC2012)))
+head(region1_covariates_test)
+str(region1_covariates_test) 
+
+region1_mod_dat <- BIOMOD_FormatingData(resp.var = region1_train,
+                                     expl.var = region1_covariates_train,
+                                   resp.name = "Wolf.region1")
+region1_mod_dat
+                                    
+                                    
+## Define models
+# For maxent, we need to add some options to the models. 
+# Important, the directory where to find java/maxent. 
+myBiomodOptions <- BIOMOD_ModelingOptions(
+  MAXENT.Phillips = list( path_to_maxent.jar = "C:/TEMP/maxent.jar",
+                          maximumiterations = 5000,
+                          responsecurves=TRUE,
+                          jacknife=TRUE,
+                          replicates=3,
+                          visible = FALSE,
+                          directory="/output/results/regional_ensemble/Wolf_region1",
+                          linear = TRUE, 
+                          quadratic = TRUE,
+                          product = TRUE,
+                          threshold = FALSE,
+                          hinge = TRUE,
+                          lq2lqptthreshold = 80,
+                          l2lqthreshold = 10,
+                          hingethreshold = 15,
+                          beta_threshold = -1,
+                          beta_categorical = -1,
+                          beta_lqp = -1,
+                          beta_hinge = -1,
+                          defaultprevalence = 0.5))
+
+region1_mod_out <- BIOMOD_Modeling(data = region1_mod_dat,
+                            models =c('GLM','GAM','GBM', 'MARS', 'ANN','RF','MAXENT.Phillips'),
+                            SaveObj = TRUE,
+                           models.options = myBiomodOptions,
+                           NbRunEval = 10,
+                           DataSplit = 80, # common practice to validate: 80 train, 20 test
+                           models.eval.meth = c('KAPPA','TSS','ROC'),
+                           VarImport = 10)
+
+region1_mod_out
+str(region1_mod_out)
+region1_mod_out@models.computed
+# saveRDS(region1_mod_out, paste0(results_wd, "/region1_biomod_out.rds"))
+
+# get all models evaluation
+wolf_ModelEval <- get_evaluations(region1_mod_out)
+wolf_ModelEval
+# print the dimnames of this object
+dimnames(wolf_ModelEval)
+
+# get the AUC scores 
+(AUC_table <- wolf_ModelEval["ROC","Testing.data",,,])
+rowSums(AUC_table[,1:10])/10
+
+# get the TSS scores 
+(TSS_table <- wolf_ModelEval["TSS","Testing.data",,,])
+rowSums(TSS_table[,1:10])/10
+
+# write.csv(AUC_table, paste0(results_wd, "/region1_AUCTable.csv"))
+# write.csv(TSS_table, paste0(results_wd, "/region1_TSSTable.csv"))
+```
+
+## get variable importance
+```{r}
+# print variable importances
+wolf_VarImpor <- get_variables_importance(region1_mod_out)
+wolf_VarImpor
+# Variable importance of the full model
+VarImpor_table <- wolf_VarImpor[,,"Full","AllData"]
+VarImpor_table
+# write.csv(VarImpor_table, paste0(results_wd,
+#                                  "/region1_VariableImportance_FullModel.csv"))
+
+
+## Average variable importance in the 10 model replicates
+# extract the matrices to a list
+wolf_VarImpor_list <- list()
+for (i in 1:10){
+  wolf_VarImpor_list[[i]] <- as.data.frame(wolf_VarImpor[,,i,])
+}
+
+for (i in 1:length(wolf_VarImpor_list)){
+  wolf_VarImpor_list[[i]]$RUN <- paste0("Run_", i)
+}
+
+wolf_VarImport_allmodels <- do.call(rbind, wolf_VarImpor_list)
+# write.csv(wolf_VarImport_allmodels, paste0(results_wd,
+#                                            "/region1_VariableImportance_avg.csv"))
+```
+
+
+## Make ensemble
+```{r}
+### Building ensemble-models
+# All models with AUC > 0.7
+region1_ensemblemod <- BIOMOD_EnsembleModeling(
+  modeling.output = region1_mod_out,
+  chosen.models = 'all',
+  em.by='all', 
+  eval.metric = c('ROC'),
+  eval.metric.quality.threshold = c(0.7), # model above 0.7 AUC values
+  prob.mean.weight = T,
+  prob.mean.weight.decay = 'proportional')
+
+region1_ensemblemod
+# saveRDS(region1_ensemblemod, paste0(results_wd, "/region1_ensemble_mod.rds"))
+
+# get evaluation scores
+get_evaluations(region1_ensemblemod)
+```
+
+
+## Project models
+```{r}
+# load rasters environmental rasters
+env_germany <- stack(paste0(geoproc_wd, "/stack_env_rasters_germany_3035_AP.tif"))
+names(env_germany) <- c("CLC2012", "Pop_den", "HFP", "Dist_settl", "Dist_roads") 
+
+env_germany2 <- stack(paste0(geoproc_wd, "/stack_env_rasters_germany_1km_3035_AP.tif"))
+names(env_germany2) <- c("CLC2012", "Pop_den", "HFP", "Dist_settl", "Dist_roads") 
+
+### Project individual models
+region1_BiomodProj <- BIOMOD_Projection(
+  modeling.output = region1_mod_out,
+  new.env = env_germany2,
+  proj.name = 'region1',
+  selected.models = 'all',
+  compress = 'gzip',
+  build.clamping.mask = F,
+  output.format = '.grd', 
+  do.stack=T)
+
+region1_BiomodProj
+# saveRDS(region1_BiomodProj, paste0(results_wd, "/region1_biomod_projection.rds"))
+
+
+## Project ensemble-model
+region1_BiomodEF <- BIOMOD_EnsembleForecasting(EM.output = region1_ensemblemod,
+                            projection.output = NULL, 
+                            new.env = env_germany2,
+                            selected.models = 'all',
+                            proj.name = "Region1",
+                            compress = 'gzip')
+region1_BiomodEF
+# saveRDS(region1_BiomodEF, paste0(results_wd, "/region1_ensemble_forcasting.rds"))
+
+region1_projEnsemble <- get_predictions(region1_BiomodEF)
+names(region1_projEnsemble)
+
+region1_EnsembleResult_wm <- region1_projEnsemble$Region1_EMwmeanByROC_mergedAlgo_mergedRun_mergedData # weighted mean model based on AUC
+
+# writeRaster(region1_EnsembleResult_wm,
+#             filename = paste0(results_wd, "/region1_ensemble_weightedmean_projection_3035.tif"),
+#             overwrite = T)
+```
+
+## Calculate MESS for wolf predictions
+```{r}
+# Extract the environmental values in wolf presences
+ref_env_r1 <- region1_allpoints %>% 
+  as.data.frame() %>% 
+  dplyr::filter(data == "presences") %>% 
+  dplyr::select(CLC2012:Dist_roads)
+
+# create the mess using full germany rasters
+mess_wolf_r1 <- mess(env_germany, ref_env_r1, full = TRUE)
+mess_wolf_r1 <- subset(mess_wolf_r1, 6, drop = FALSE)
+# writeRaster(mess_wolf_r1, paste0(results_wd, "/region1_MESS_100m_3035.tif"), 
+#             overwrite = T)
+plot(mess_wolf_r1, breaks = c(-40, 40))
+plot(st_geometry(region1_allpoints), add = TRUE)
+```
+
+
+# Region 2
+```{r}
+### extract region 2 data
+# MCP
+region2_mcp <- mcp95_all_sf %>%
+  dplyr::filter(id %in% region2_id) %>% 
+  st_cast("POLYGON")
+
+# Presences within those mcps
+region2_pres <- st_join(wolf_presences, region2_mcp, join = st_intersects) %>% 
+  dplyr::filter(!is.na(id)) %>% 
+  distinct(geom, .keep_all = TRUE) %>% 
+  distinct(.keep_all = TRUE) %>% # remove duplicated coordinates due to overlapping mcps
+  dplyr::select(-c(id, area, color))
+
+# create buffer 50 km and dissolve
+region2_buffer <- st_buffer(region2_mcp, 50000) %>% 
+  st_union() %>% 
+  st_sf() %>% 
+  mutate(region = "region2") 
+
+# extract bg points
+n_pres <- nrow(region2_pres)
+region2_bg <- st_join(wolf_bg, region2_buffer, join = st_within) %>% 
+  dplyr::filter(!is.na(region)) %>% # remove points out of the polygon
+  sample_n(n_pres) %>%  # sample random rows number = n_pres
+  dplyr::select(-region)
+
+plot(region2_buffer)
+plot(st_geometry(region2_mcp), add = TRUE, col = "blue")
+plot(st_geometry(region2_pres), add = TRUE, col = "green")
+plot(st_geometry(region2_bg), add = TRUE, col = "red")
+
+# merge data for analysis
+region2_pres
+region2_bg
+region2_allpoints <- rbind(region2_pres, region2_bg)
+
+st_write(region2_allpoints, paste0(dataproc_wd, 
+                                   "/region2_allpoints_3035.gpkg"))
+```
+
+## Run model region 2
+
+```{r}
+## Formating data
+# Transform points into presence (1) - absence (0) and divide into train and test sets
+region2_train <- region2_allpoints %>% 
+  filter(fold != 5) %>% 
+  mutate(pres_bg = case_when(
+    data == "presences" ~ 1,
+    data == "background" ~ 0)) %>% 
+  dplyr::select(pres_bg) %>% 
+  as_Spatial()
+region2_train
+table(region2_train$pres_bg)
+
+nrow(region2_train)
+
+region2_test <- region2_allpoints %>% 
+  filter(fold == 5) %>% 
+  mutate(pres_bg = case_when(
+    data == "presences" ~ 1,
+    data == "background" ~ 0)) %>% 
+  dplyr::select(pres_bg) %>% 
+  as_Spatial()
+
+region2_test
+table(region2_test$pres_bg)
+
+nrow(region2_test) 
+
+
+## Extract environmental covariates
+head(region2_allpoints)
+
+region2_covariates_train <- region2_allpoints %>%
+  filter(fold != 5) %>% 
+  as.data.frame() %>% 
+  dplyr::select(CLC2012:Dist_roads) %>% 
+  mutate(CLC2012 = as.factor(as.character(CLC2012)))
+head(region2_covariates_train)
+str(region2_covariates_train) 
+
+region2_covariates_test <- region2_allpoints %>%
+  filter(fold == 5) %>% 
+  as.data.frame() %>% 
+  dplyr::select(CLC2012:Dist_roads) %>% 
+  mutate(CLC2012 = as.factor(as.character(CLC2012)))
+head(region2_covariates_test)
+str(region2_covariates_test) 
+
+
+region2_mod_dat <- BIOMOD_FormatingData(resp.var = region2_train,
+                                     expl.var = region2_covariates_train,
+                                    resp.name = "Wolf.region2")
+region2_mod_dat
+                                    
+                                    
+## Define models
+# For maxent, we need to add some options to the models. 
+# Important, the directory where to find java/maxent. 
+myBiomodOptions <- BIOMOD_ModelingOptions(
+  MAXENT.Phillips = list( path_to_maxent.jar = "C:/TEMP/maxent.jar",
+                          maximumiterations = 5000,
+                          responsecurves=TRUE,
+                          jacknife=TRUE,
+                          replicates=3,
+                          visible = FALSE,
+                          directory="/output/results/regional_ensemble/Wolf_region2",
+                          linear = TRUE, 
+                          quadratic = TRUE,
+                          product = TRUE,
+                          threshold = FALSE,
+                          hinge = TRUE,
+                          lq2lqptthreshold = 80,
+                          l2lqthreshold = 10,
+                          hingethreshold = 15,
+                          beta_threshold = -1,
+                          beta_categorical = -1,
+                          beta_lqp = -1,
+                          beta_hinge = -1,
+                          defaultprevalence = 0.5))
+
+region2_mod_out <- BIOMOD_Modeling(data = region2_mod_dat,
+                            models =c('GLM','GAM','GBM', 'MARS', 'ANN','RF','MAXENT.Phillips'),
+                            SaveObj = TRUE,
+                           models.options = myBiomodOptions,
+                           NbRunEval = 10,
+                           DataSplit = 80, # common practice to validate: 80 train, 20 test
+                           models.eval.meth = c('KAPPA','TSS','ROC'),
+                           VarImport = 10)
+
+region2_mod_out
+str(region2_mod_out)
+region2_mod_out@models.computed
+# saveRDS(region2_mod_out, paste0(results_wd, "/region2_biomod_out.rds"))
+
+
+# get all models evaluation
+wolf_ModelEval <- get_evaluations(region2_mod_out)
+wolf_ModelEval
+# print the dimnames of this object
+dimnames(wolf_ModelEval)
+
+# get the AUC scores 
+(AUC_table <- wolf_ModelEval["ROC","Testing.data",,,])
+rowSums(AUC_table[,1:10])/10
+
+# get the TSS scores 
+(TSS_table <- wolf_ModelEval["TSS","Testing.data",,,])
+rowSums(TSS_table[,1:10])/10
+
+# write.csv(AUC_table, paste0(results_wd, "/region2_AUCTable.csv"))
+# write.csv(TSS_table, paste0(results_wd, "/region2_TSSTable.csv"))
+```
+
+## get variable importance
+```{r}
+# print variable importances
+wolf_VarImpor <- get_variables_importance(region2_mod_out)
+wolf_VarImpor
+# Variable importance of the full model
+VarImpor_table <- wolf_VarImpor[,,"Full","AllData"]
+VarImpor_table
+# write.csv(VarImpor_table, paste0(results_wd,
+#                                  "/region2_VariableImportance_FullModel.csv"))
+
+
+## Average variable importance in the 10 model replicates
+# extract the matrices to a list
+wolf_VarImpor_list <- list()
+for (i in 1:10){
+  wolf_VarImpor_list[[i]] <- as.data.frame(wolf_VarImpor[,,i,])
+}
+
+for (i in 1:length(wolf_VarImpor_list)){
+  wolf_VarImpor_list[[i]]$RUN <- paste0("Run_", i)
+}
+
+wolf_VarImport_allmodels <- do.call(rbind, wolf_VarImpor_list)
+# write.csv(wolf_VarImport_allmodels, paste0(results_wd,
+#                                            "/region2_VariableImportance_avg.csv"))
+```
+
+
+## Make ensemble
+```{r}
+### Building ensemble-models
+# All models with AUC > 0.7
+region2_ensemblemod <- BIOMOD_EnsembleModeling(
+  modeling.output = region2_mod_out,
+  chosen.models = 'all',
+  em.by='all', 
+  eval.metric = c('ROC'),
+  eval.metric.quality.threshold = c(0.7), # model above 0.7 AUC values
+  prob.mean = TRUE,
+  prob.cv = FALSE,
+  prob.ci = FALSE,
+  prob.ci.alpha = 0.05,
+  prob.median = FALSE,
+  committee.averaging = FALSE,
+  prob.mean.weight = TRUE,
+  prob.mean.weight.decay = 'proportional')
+
+region2_ensemblemod 
+# saveRDS(region2_ensemblemod, paste0(results_wd, "/region2_ensemble_mod.rds"))
+# get evaluation scores
+get_evaluations(region2_ensemblemod)
+```
+
+
+## Project models
+```{r}
+# load rasters environmental rasters
+env_germany <- stack(paste0(geoproc_wd, "/stack_env_rasters_germany_3035_AP.tif"))
+names(env_germany) <- c("CLC2012", "Pop_den", "HFP", "Dist_settl", "Dist_roads") 
+
+# load aggregated rasters at 1 km resolution for faster projections
+env_germany2 <- stack(paste0(geoproc_wd, "/stack_env_rasters_germany_1km_3035_AP.tif"))
+names(env_germany2) <- c("CLC2012", "Pop_den", "HFP", "Dist_settl", "Dist_roads")
+
+### Project individual models
+region2_BiomodProj <- BIOMOD_Projection(
+  modeling.output = region2_mod_out,
+  new.env = env_germany2,
+  proj.name = 'region2',
+  selected.models = 'all',
+  compress = 'gzip',
+  build.clamping.mask = F,
+  output.format = '.grd', 
+  do.stack=T)
+
+region2_BiomodProj
+# saveRDS(region2_BiomodProj, paste0(results_wd, "/region2_biomod_projection.rds"))
+
+## Project ensemble-model
+region2_BiomodEF <- BIOMOD_EnsembleForecasting(EM.output = region2_ensemblemod,
+                            projection.output = region2_BiomodProj, 
+                            selected.models = 'all',
+                            proj.name = "Region2",
+                            compress = 'gzip')
+region2_BiomodEF
+# saveRDS(region2_BiomodEF, paste0(results_wd, "/region2_ensemble_forcasting.rds"))
+
+region2_projEnsemble <- get_predictions(region2_BiomodEF)
+names(region2_projEnsemble)
+
+region2_EnsembleResult_wm <- region2_projEnsemble$Wolf.region2_EMwmeanByROC_mergedAlgo_mergedRun_mergedData # weighted mean model
+plot(region2_EnsembleResult_wm)
+
+## It has gaps due to NAs in the means. We do it manually.
+#### WEIGHTED MEAN
+names(region2_indmodelProj)
+length(names(region2_indmodelProj)) 
+
+# get AUC values
+region2_AUC_table <- read.csv(paste0(results_wd, "/region2_AUCTable.csv"), row.names = 1)
+region2_AUC_values <- gather(region2_AUC_table)
+region2_AUC_values <- region2_AUC_values %>%  
+  mutate(model = paste0("Wolf.region2_AllData_", key, "_",rep(rownames(region2_AUC_table), 10)))
+region2_AUC_values
+
+# Remove models with AUC < 0.7
+models_to_remove <- region2_AUC_values$model[region2_AUC_values$value < 0.7]
+models_to_remove # 9
+region2_indmodelProj_formean <- dropLayer(region2_indmodelProj, models_to_remove)
+length(names(region2_indmodelProj_formean)) # 68
+
+# compute weighted mean based on AUC values
+region2_Results_wm <- calc(region2_indmodelProj,fun = weighted.mean, na.rm = TRUE, w = region2_AUC_values$value) 
+plot(region2_Results_wm)
+
+# writeRaster(region2_Results_wm,
+#             filename = paste0(results_wd, "/region2_ensemble_weightedmean_projection_1km_3035.tif"),
+#             overwrite = T)
+```
+
+
+## Calculate MESS for wolf predictions
+```{r}
+# Extract the environmental values in wolf presences
+ref_env_r2 <- region2_allpoints %>% 
+  as.data.frame() %>% 
+  dplyr::filter(data == "presences") %>% 
+  dplyr::select(CLC2012:Dist_roads)
+
+# create the mess using full germany rasters
+mess_wolf_r2 <- mess(env_germany, ref_env_r2, full = TRUE)
+mess_wolf_r2 <- subset(mess_wolf_r2, 6, drop = FALSE)
+
+# writeRaster(mess_wolf_r2, paste0(results_wd, "/region2_MESS_100m_3035.tif"), 
+#             overwrite = T)
+plot(mess_wolf_r2)
+```
+
+
+
+# Region 3
+
+```{r}
+### extract region 3 data
+# MCP
+region3_mcp <- mcp95_all_sf %>%
+  dplyr::filter(id %in% region3_id) %>% 
+  st_cast("POLYGON")
+
+
+# Presences within those mcps
+region3_pres <- st_join(wolf_presences, region3_mcp, join = st_intersects) %>% 
+  dplyr::filter(!is.na(id)) %>% 
+  distinct(.keep_all = TRUE) %>% # remove duplicated coordinates due to overlapping mcps
+  dplyr::select(-c(id, area, color))
+
+# create buffer 50 km and dissolve
+region3_buffer <- st_buffer(region3_mcp, 50000) %>% 
+  st_union() %>% 
+  st_sf() %>% 
+  mutate(region = "region3") 
+
+# extract bg points
+n_pres <- nrow(region3_pres)
+region3_bg <- st_join(wolf_bg, region3_buffer, join = st_within) %>% 
+  dplyr::filter(!is.na(region)) %>% # remove points out of the polygon
+  sample_n(n_pres) %>%  # sample random rows number = n_pres
+  dplyr::select(-region)
+
+plot(region3_buffer)
+plot(st_geometry(region3_mcp), add = TRUE, col = "blue")
+plot(st_geometry(region3_pres), add = TRUE, col = "green")
+plot(st_geometry(region3_bg), add = TRUE, col = "red")
+
+# merge data for analysis
+region3_pres
+region3_bg
+region3_allpoints <- rbind(region3_pres, region3_bg)
+
+# st_write(region3_allpoints, paste0(dataproc_wd, 
+#                                    "/region3_allpoints_3035.gpkg"))
+```
+
+## Run model region 3
+
+```{r}
+## Formating data
+# Transform points into presence (1) - absence (0) and divide into train and test sets
+region3_train <- region3_allpoints %>% 
+  filter(fold != 5) %>% 
+  mutate(pres_bg = case_when(
+    data == "presences" ~ 1,
+    data == "background" ~ 0)) %>% 
+  dplyr::select(pres_bg) %>% 
+  as_Spatial()
+region3_train
+table(region3_train$pres_bg)
+
+nrow(region3_train) 
+
+region3_test <- region3_allpoints %>% 
+  filter(fold == 5) %>% 
+  mutate(pres_bg = case_when(
+    data == "presences" ~ 1,
+    data == "background" ~ 0)) %>% 
+  dplyr::select(pres_bg) %>% 
+  as_Spatial()
+
+region3_test
+table(region3_test$pres_bg)
+
+nrow(region3_test)
+
+## Extract environmental covariates
+head(region3_allpoints)
+
+region3_covariates_train <- region3_allpoints %>%
+  filter(fold != 5) %>% 
+  as.data.frame() %>% 
+  dplyr::select(CLC2012:Dist_roads) %>% 
+  mutate(CLC2012 = as.factor(as.character(CLC2012)))
+head(region3_covariates_train)
+str(region3_covariates_train) 
+
+region3_covariates_test <- region3_allpoints %>%
+  filter(fold == 5) %>% 
+  as.data.frame() %>% 
+  dplyr::select(CLC2012:Dist_roads) %>% 
+  mutate(CLC2012 = as.factor(as.character(CLC2012)))
+head(region3_covariates_test)
+str(region3_covariates_test) 
+
+region3_mod_dat <- BIOMOD_FormatingData(resp.var = region3_train,
+                                     expl.var = region3_covariates_train,
+                                    resp.name = "Region3")
+region3_mod_dat
+                                    
+                                    
+## Define models
+# For maxent, we need to add some options to the models. 
+# Important, the directory where to find java/maxent. 
+myBiomodOptions <- BIOMOD_ModelingOptions(
+  MAXENT.Phillips = list( path_to_maxent.jar = "C:/TEMP/maxent.jar",
+                          maximumiterations = 5000,
+                          responsecurves=TRUE,
+                          jacknife=TRUE,
+                          replicates=3,
+                          visible = FALSE,
+                          directory="/output/results/regional_ensemble/Wolf_region3/",
+                          linear = TRUE, 
+                          quadratic = TRUE,
+                          product = TRUE,
+                          threshold = FALSE,
+                          hinge = TRUE,
+                          lq2lqptthreshold = 80,
+                          l2lqthreshold = 10,
+                          hingethreshold = 15,
+                          beta_threshold = -1,
+                          beta_categorical = -1,
+                          beta_lqp = -1,
+                          beta_hinge = -1,
+                          defaultprevalence = 0.5))
+
+region3_mod_out <- BIOMOD_Modeling(data = region3_mod_dat,
+                            models =c('GLM','GAM','GBM', 'MARS', 'ANN','RF','MAXENT.Phillips'),
+                            SaveObj = TRUE,
+                           models.options = myBiomodOptions,
+                           NbRunEval = 10,
+                           DataSplit = 80, # common practice to validate: 80 train, 20 test
+                           models.eval.meth = c('KAPPA','TSS','ROC'),
+                           VarImport = 10)
+
+region3_mod_out
+str(region3_mod_out)
+region3_mod_out@models.computed
+# saveRDS(region3_mod_out, paste0(results_wd, "/region3_biomod_out.rds"))
+
+# get all models evaluation
+region3_ModelEval <- get_evaluations(region3_mod_out)
+region3_ModelEval
+# print the dimnames of this object
+dimnames(region3_ModelEval)
+
+# get the AUC scores 
+(AUC_table <- region3_ModelEval["ROC","Testing.data",,,])
+rowSums(AUC_table[,1:10])/10
+
+# get the TSS scores 
+(TSS_table <- region3_ModelEval["TSS","Testing.data",,,])
+rowSums(TSS_table[,1:10])/10
+
+# write.csv(AUC_table, paste0(results_wd, "/region3_AUCTable.csv"))
+# write.csv(TSS_table, paste0(results_wd, "/region3_TSSTable.csv"))
+```
+
+## get variable importance
+```{r}
+# print variable importances
+region3_VarImpor <- get_variables_importance(region3_mod_out)
+region3_VarImpor
+# Variable importance of the full model
+VarImpor_table <- region3_VarImpor[,,"Full","AllData"]
+VarImpor_table
+# write.csv(VarImpor_table, paste0(results_wd,
+#                                  "/region3_VariableImportance_FullModel.csv"))
+
+
+## Average variable importance in the 10 model replicates
+# extract the matrices to a list
+region3_VarImpor_list <- list()
+for (i in 1:10){
+  region3_VarImpor_list[[i]] <- as.data.frame(region3_VarImpor[,,i,])
+}
+
+for (i in 1:length(region3_VarImpor_list)){
+  region3_VarImpor_list[[i]]$RUN <- paste0("Run_", i)
+}
+
+region3_VarImport_allmodels <- do.call(rbind, region3_VarImpor_list)
+# write.csv(region3_VarImport_allmodels, paste0(results_wd,                                           "/region3_VariableImportance_avg.csv"))
+```
+
+
+## Make ensemble
+```{r}
+### Building ensemble-models
+# All models with AUC > 0.7
+
+get_built_models(region3_mod_out)
+region3_ensemblemod <- BIOMOD_EnsembleModeling(
+  modeling.output = region3_mod_out,
+  # chosen.models = 'all',
+  chosen.models = get_built_models(region3_mod_out),
+  em.by='all', 
+  eval.metric = c('ROC'),
+  eval.metric.quality.threshold = c(0.7), # model above 0.7 AUC values
+  prob.mean = T,
+  prob.cv = T,
+  prob.ci = T,
+  prob.ci.alpha = 0.05,
+  prob.median = T,
+  committee.averaging = T,
+  prob.mean.weight = T,
+  prob.mean.weight.decay = 'proportional')
+
+region3_ensemblemod
+# saveRDS(region3_ensemblemod, paste0(results_wd, "/region3_ensemble_mod.rds"))
+# get evaluation scores
+get_evaluations(region3_ensemblemod)
+```
+
+
+```{r}
+region3_ensemblemod <- BIOMOD_EnsembleModeling( 
+                 modeling.output = region3_mod_out,
+                 chosen.models = get_built_models(region3_mod_out), 
+                 em.by = 'all',
+                 eval.metric = c('ROC'),
+                 eval.metric.quality.threshold = c(0.7),
+                 prob.mean = FALSE,
+                 prob.cv = FALSE,
+                 prob.ci = FALSE,
+                 prob.ci.alpha = 0.05,
+                 prob.median = FALSE,
+                 committee.averaging = TRUE,
+                 prob.mean.weight = FALSE,
+                 prob.mean.weight.decay = 'proportional' )
+
+
+
+test <- get_predictions(region3_ensemblemod)
+region3_indmodelProj
+region3_Result <- calc(region3_indmodelProj,fun = mean, na.rm = TRUE); #Choose whatever descriptive statistic you'd like
+region3_Result <- calc(region3_indmodelProj[[1]],fun = mean) #Choose whatever descriptive statistic you'd like
+plot(region3_Result)
+region3_Result <- calc(region3_indmodelProj[[11:20]],fun = mean) #Choose whatever descriptive statistic you'd like
+plot(region3_Result)
+```
+
+
+## Project models
+```{r}
+# load rasters environmental rasters
+env_germany <- stack(paste0(geoproc_wd, "/stack_env_rasters_germany_3035_AP.tif"))
+names(env_germany) <- c("CLC2012", "Pop_den", "HFP", "Dist_settl", "Dist_roads") 
+
+# aggregate rasters at 1 km resolution for faster projections
+env_germany2 <- aggregate(env_germany, fact = 10, fun = mean, na.rm = TRUE)
+# writeRaster(env_germany2, paste0(geoproc_wd, "/stack_env_rasters_germany_1km_3035_AP.tif"))
+env_germany2 <- stack(env_germany2)
+
+### Project individual models
+region3_BiomodProj <- BIOMOD_Projection(
+  modeling.output = region3_mod_out,
+  new.env = env_germany2,
+  proj.name = 'region3',
+  selected.models = get_built_models(region3_mod_out),
+  compress = 'gzip',
+  build.clamping.mask = F,
+  output.format = '.grd', 
+  do.stack=T, 
+  na.omit = FALSE)
+
+region3_mod_out@models.computed
+region3_BiomodProj
+# saveRDS(region3_BiomodProj, paste0(results_wd, "/region3_biomod_projection.rds"))
+
+
+## Project ensemble-model
+region3_BiomodEF <- BIOMOD_EnsembleForecasting(EM.output = region3_ensemblemod,
+                            projection.output = region3_BiomodProj,
+                           proj.name = "Region3",
+                            compress = 'gzip')
+region3_BiomodEF
+# saveRDS(region3_BiomodEF, paste0(results_wd, "/region3_ensemble_forcasting.rds"))
+
+region3_projEnsemble <- get_predictions(region3_BiomodEF)
+names(region3_projEnsemble)
+
+region3_EnsembleResult_wm <- region3_projEnsemble$Region3_EMwmeanByROC_mergedAlgo_mergedRun_mergedData  # weighted mean model based on AUC
+plot(region3_EnsembleResult_wm)
+# writeRaster(region3_EnsembleResult_wm,
+#             filename = paste0(results_wd, "/region3_ensemble_weightedmean_projection_3035.tif"),
+#             overwrite = T)
+```
+
+
+## Calculate MESS for wolf predictions
+```{r}
+# Extract the environmental values in wolf presences
+ref_env_r3 <- region3_allpoints %>% 
+  as.data.frame() %>% 
+  dplyr::filter(data == "presences") %>% 
+  dplyr::select(CLC2012:Dist_roads)
+
+# create the mess using full germany rasters
+mess_wolf_r3 <- mess(env_germany, ref_env_r3, full = TRUE)
+mess_wolf_r3 <- subset(mess_wolf_r3, 6, drop = FALSE)
+mess_wolf_r3
+# writeRaster(mess_wolf_r3, paste0(results_wd, "/region3_MESS_100m_3035.tif"), 
+#             overwrite = T);
+plot(mess_wolf_r3)
+```
+
+
+
+
+## Sizes of the regions
+```{r}
+region1_mcp
+region2_mcp
+region3_mcp
+
+plot(st_union(region1_mcp))
+plot(st_union(region2_mcp))
+plot(st_union(region3_mcp))
+
+st_area(st_union(region1_mcp))
+
+st_area(st_union(region2_mcp))
+
+st_area(st_union(region3_mcp))
+```
+
