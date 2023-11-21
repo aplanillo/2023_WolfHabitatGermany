@@ -1,6 +1,10 @@
 # Planillo_etal2023_DivDist
- 
-This repository contains the R-scripts used in the analysis of wolf habitat suitabilty in Germany and the non-stationary habitat selection of the expanding population. 
+
+This repository contains the R-scripts used in the analysis of wolf habitat suitabilty in Germany and the non-stationary habitat selection of the expanding population, as published in:
+
+> Planillo, A., Wenzler-Meya, M., Reinhardt, I., Kluth, G., Michler, F.-U., Stier, N., Louvrier, J., Steyer, K., Gillich, B., Rieger, S., Knauer, F., Kuemmerle, T., & Kramer-Schadt, S. (2023). Understanding habitat selection of range-expanding populations of large carnivores: 20 years of grey wolves (Canis lupus) recolonizing Germany. Diversity and Distributions, 00, 1–16. https://doi.org/10.1111/ddi.13789 
+
+
 Due to conservation concern, the original data is not provided. Data at a broader scale can be found in the _data_ folder.
 
 In the _Rscripts_ folder there are eight scripts, two source scripts and six scripts for the analyses.
